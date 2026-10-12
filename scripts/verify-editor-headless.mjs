@@ -1860,8 +1860,29 @@ async function runCreateAndDraft(ctx) {
   await clickSel('.ed-sound [data-sound="preview"]');
   await waitFor(`document.querySelector('.ed-sound [data-sound="preview"]').dataset.playing === '1'`, 8000).catch(() => {});
   check((await playing()) === "1", "点「试听」：按钮进入播放态");
+  // 停止前装钩子：试听停了必须卸掉元素 src，才放得开系统「正在播放」槽位
+  // （暂停 / muted 都不释放，媒体桥会一直读到本页 → 用户播放器的封面全丢）
+  await ev(`(() => {
+    window.__relPreview = { rm: 0, ld: 0 };
+    const origRm = Element.prototype.removeAttribute;
+    Element.prototype.removeAttribute = function (n) {
+      if (n === "src" && this instanceof HTMLMediaElement) window.__relPreview.rm++;
+      return origRm.apply(this, arguments);
+    };
+    const origLd = HTMLMediaElement.prototype.load;
+    HTMLMediaElement.prototype.load = function () {
+      window.__relPreview.ld++;
+      return origLd.apply(this, arguments);
+    };
+    return true;
+  })()`);
   await clickSel('.ed-sound [data-sound="preview"]');
   check((await playing()) === "0", "再点：停止试听");
+  var relPreview = await ev(`(() => { const r = window.__relPreview || {}; return { rm: r.rm, ld: r.ld }; })()`);
+  check(
+    relPreview.rm >= 1 && relPreview.ld >= 1,
+    `★ 停止试听卸掉 src（removeAttribute('src')×${relPreview.rm} / load()×${relPreview.ld}）→ 释放系统「正在播放」槽位，媒体桥才读得到用户播放器`,
+  );
 
   await sndSet("volume", "0.5");
   await sndSet("playbackmode", "single");
@@ -1916,6 +1937,34 @@ async function runCreateAndDraft(ctx) {
     return { res, playing: window.__sceneLayers.find((x) => x.soundCtl).soundCtl.isPlaying(), rs: el?.readyState, dur: el?.duration, loop: el?.loop };
   })()`);
   check(auAA.res === "ok" && auAA.playing && auAA.rs >= 2 && Math.abs(auAA.dur - 0.8) < 0.05 && auAA.loop, `★ 脚本侧 play() 后真的在播：解码出 ${auAA.dur?.toFixed(2)}s（bird.wav），循环 ${auAA.loop}，结果 ${auAA.res}`);
+
+  // ★ 音量归零必须卸 src（释放系统「正在播放」槽位），音量回来要装回并续播
+  var relBench = await ev(`(async () => {
+    const inst = window.__wp;
+    const l = window.__sceneLayers.find((x) => x.soundCtl);
+    const orig = HTMLMediaElement.prototype.play;
+    let el = null;
+    HTMLMediaElement.prototype.play = function () { el = this; return orig.apply(this, arguments); };
+    l.soundCtl.play();
+    for (let i = 0; i < 40 && !el; i++) await new Promise((r) => setTimeout(r, 100));
+    HTMLMediaElement.prototype.play = orig;
+    if (!el) return { ok: false, why: "no element" };
+    const snap = () => ({ src: el.hasAttribute("src"), paused: el.paused, t: +el.currentTime.toFixed(2) });
+    inst.setVolume(0.5);
+    await new Promise((r) => setTimeout(r, 400));
+    const at05 = { ...snap(), playing: l.soundCtl.isPlaying() };
+    inst.setVolume(0);
+    await new Promise((r) => setTimeout(r, 400));
+    const at00 = snap();
+    inst.setVolume(0.5);
+    for (let i = 0; i < 40 && el.paused; i++) await new Promise((r) => setTimeout(r, 100));
+    const back = { ...snap(), playing: l.soundCtl.isPlaying() };
+    return { ok: true, at05, at00, back };
+  })()`);
+  check(
+    relBench.ok && relBench.at05.src && relBench.at05.playing && relBench.at00.src === false && relBench.at00.paused && relBench.back.src && relBench.back.playing,
+    `★ 音量归零卸 src 释放系统「正在播放」槽位、回来后续播：0.5 → ${JSON.stringify(relBench.at05)} / 0 → ${JSON.stringify(relBench.at00)} / 回 0.5 → ${JSON.stringify(relBench.back)}`,
+  );
 
   } catch (err) { await hlAbort("AA", "AA. 声音层端到端（空白 → 导入 WAV → 试听 → 音量 / 模式 / 开始静音 → 撤销 → 替换 → 存库 → 测试台装上音频）", err); }
   section("AB. 关键帧动画端到端（文字层 → 开位置动画 → 2s 处改 x 自动落关键帧 → 跳关键帧 → 1s 处拖拽 → 撤销 → 删帧 / 模式 / 时长 / 插值 → 存库 → 测试台在动）");

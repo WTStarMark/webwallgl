@@ -88,6 +88,10 @@ const sourceAlias = {
     b.onLoad({ filter: /.*/, namespace: "editor-api" }, () => ({
       contents: [
         `export * from ${json(path.join(ROOT, "renderer/src/api/source.ts"))};`,
+        // 真实出口 renderer/src/api/editor.ts = export * from ./index（播放包超集），
+        // 这里只补编辑器应用与判据真的要跑的那几个运行时值；媒体源构造辅助是纯数据
+        // 模块（只 import 类型），可以直接接真文件。
+        `export { createMediaSource, mediaColor } from ${json(path.join(ROOT, "renderer/src/api/media-source.ts"))};`,
         `export { buildScenePkg } from ${json(path.join(ROOT, "renderer/src/editor/pkg-export.ts"))};`,
         `export { checkWeCompat } from ${json(path.join(ROOT, "renderer/src/editor/compat.ts"))};`,
         `export { encodeMdl, mdlMeshMaterials, retargetMdlMaterial, mdlClips, applyBoneDelta, boneDeltaWeights, CLIP_MODES, resampleTrack, addMdlClip, removeMdlClip, setMdlClipMeta, setMdlClipEvents } from ${json(path.join(ROOT, "renderer/src/editor/mdl-edit.ts"))};`,
@@ -2244,6 +2248,59 @@ section("AA3. 编辑器音频源 editor/audio-live.ts（系统音频 / 试听 �
   sys.start(); // 幂等：重复开会话不叠加连接
   sys.stop();
   check(sys.status() === "off" && sys.live() === false, "开 / 关系统音频幂等，关掉后状态回到 off");
+  // 媒体桥接：宿主那条 SSE 里除频谱还带 media 快照，编辑器必须把它折成 MediaSource
+  // （否则「音条会动、封面不出来」—— 频谱装了、封面这条线根本没接）。
+  {
+    const realES = globalThis.EventSource;
+    let esInst = null;
+    class FakeES {
+      constructor(url) {
+        this.url = url;
+        this.onmessage = null;
+        esInst = this;
+      }
+      close() {
+        this.closed = true;
+      }
+    }
+    globalThis.EventSource = FakeES;
+    try {
+      const sys2 = al.createSystemAudioSource("");
+      const m0 = sys2.media();
+      check(
+        !!m0 && m0.snapshot.hasMedia === false && m0.snapshot.hasThumbnail === false,
+        "媒体源初始为「无媒体」快照（没收到 SSE 前不谎报有封面）",
+      );
+      sys2.start();
+      check(!!esInst && /\/api\/system\/stream$/.test(esInst.url), "系统实况只开一条 SSE（/api/system/stream）");
+      const push = (payload) => esInst.onmessage({ data: JSON.stringify(payload) });
+      push({ media: { hasMedia: true, state: 1, title: "T", artist: "A", album: "B", position: 3, duration: 200, hasArtwork: true } });
+      const snap = m0.snapshot;
+      check(
+        snap.hasMedia === true && snap.state === 1 && snap.title === "T" && snap.artist === "A" && snap.hasThumbnail === true &&
+          snap.thumbnail === "/api/system/artwork?k=" + encodeURIComponent("T|A|B"),
+        "SSE 的 media → 引擎媒体源：封面指向宿主 /api/system/artwork（scene-mount 按 URL 变化 fetch + 上传 $mediaThumbnail）",
+      );
+      const urlBefore = m0.snapshot.thumbnail;
+      push({ media: { hasMedia: true, state: 1, title: "T", artist: "A", album: "B", position: 9, duration: 200, hasArtwork: true } });
+      check(m0.snapshot.thumbnail === urlBefore && m0.snapshot.position === 9, "同一首歌内只更新进度、不换封面 URL（换 URL 会让场景反复重传封面）");
+      // 宿主同一条 SSE 上还有约 30Hz 的频谱帧（{audio}，不带 media 字段）：
+      // 把「这帧没带 media」当成「没在播」会把 2Hz 的媒体快照按 30Hz 洗掉（封面永远不出来）。
+      push({ audio: { bands: [255, 0, 0] } });
+      check(
+        m0.snapshot.hasMedia === true && m0.snapshot.title === "T" && m0.snapshot.hasThumbnail === true && m0.snapshot.thumbnail === urlBefore,
+        "频谱帧不带 media 字段时不得动媒体状态（否则封面/歌名被 30Hz 的频谱帧冲掉）",
+      );
+      check(sys2.live() === true, "频谱与 media 共存于同一条 SSE：同一帧里 media 不会把频谱挤掉");
+      push({ media: { hasMedia: true, state: 2, title: "T2", artist: "A", album: "B", hasArtwork: false } });
+      check(m0.snapshot.title === "T2" && m0.snapshot.hasThumbnail === false && !m0.snapshot.thumbnail, "换到无封面的曲目时清掉封面（不留上一首的图）");
+      push({ media: { hasMedia: false } });
+      check(m0.snapshot.hasMedia === false, "宿主明说没有媒体（hasMedia:false）时才回到「无媒体」快照");
+      sys2.stop();
+    } finally {
+      globalThis.EventSource = realES;
+    }
+  }
   const freq = new Uint8Array(1024);
   freq[5] = 255;
   const bf = al.bandsFromFreq(freq);
@@ -2277,6 +2334,15 @@ section("AA3. 编辑器音频源 editor/audio-live.ts（系统音频 / 试听 �
   check(
     /if \(src\) opts\.audio = src;/.test(rsSrc) && /o\.instance\(\)\?\.setAudio\(src\)/.test(rsSrc) && /activeSrc\(\)/.test(rsSrc),
     "只在真开着音频源时才带 audio 键（键存在 = 接管整条音频模拟），换源走 setAudio 热更",
+  );
+  check(
+    /msg\.media/.test(alSrc) && /createMediaSource\(/.test(alSrc) && /\/api\/system\/artwork/.test(alSrc) && /media: \(\) => mediaSrc/.test(alSrc) &&
+      /if \(msg\.media !== undefined && msg\.media !== null\) applyMedia\(msg\.media\)/.test(alSrc),
+    "系统音频源顺带把 SSE 的 media 折成 MediaSource（封面 = 宿主 /api/system/artwork，控制面转发 media-control；只认带 media 字段的报文）",
+  );
+  check(
+    /o\.instance\(\)\?\.setMedia\(o\.sysAudio\.checked \? sys\.media\(\) : null\)/.test(rsSrc) && /if \(o\.sysAudio\.checked\) opts\.media = sys\.media\(\);/.test(rsSrc),
+    "编辑器：开系统实况时挂载带 media 键 + 换源走 setMedia，关掉交回引擎内置媒体源",
   );
   const fxSrc = fs.readFileSync(path.join(ROOT, "editor/effects.ts"), "utf8");
   // GLSL 已抽到独立 .glsl（issue #14）：声明在 audiobars.decl.glsl，装配在 effects.ts
@@ -4789,6 +4855,13 @@ section("I. 接线");
   check(/files\.every\(\(f\) => isAudioFile\(f\.file\)\)\) \{\s*void addSoundFiles\(files\.map\(\(f\) => f\.file\)\)/.test(main), "拖入全是音频时加声音层");
   check(/\{ id: "sound", order: 600, when: \(n\) => n\.kind === "sound", render: soundGroup(?:, tab: "props")? \}/.test(main) && /objEdit\(et\("log\.soundEdited"[^\n]*setSoundField\(o, field, v\)\)/.test(main) && /replaceSoundFile\(o, path\)/.test(main), "声音层检视器有「声音」分组，模式 / 音量 / 开始静音 / 替换音频经 objEdit（可撤销）");
   check(/const au = new Audio\(url\);/.test(main) && /stopPreview\(\);\s*overlay =/.test(main) && /\.\.\.renderSettings\.mountOptions\(\),/.test(main) && /value="0" \/>\s*<span id="volume-val"/.test(html), "试听用页面自己的 audio 元素，换文档即停；引擎音量跟「渲染」面板（默认 0 静音）");
+  // 试听停掉必须卸 src：媒体元素只要还挂着 src 就占着系统「正在播放」会话（暂停 /
+  // muted 都不放手），于是系统与媒体桥读到的永远是「WebWallGL 编辑器」（无封面），
+  // 用户播放器的封面全丢（Edge 实测：removeAttribute('src') + load() 才当场释放）。
+  check(
+    /function stopPreview\(\) \{[\s\S]{0,700}?preview\.au\.removeAttribute\("src"\);[\s\S]{0,120}?preview\.au\.load\(\)/.test(main),
+    "试听停止必须卸掉 src + load()，释放系统「正在播放」槽位（否则封面被预览页挡掉）",
+  );
   check(/id="ly-add-sound"/.test(html) && /id="in-sound" accept="\.mp3,\.ogg,\.wav,\.flac/.test(html) && /lyAddSoundEl\.disabled = lyAddEl\.disabled;/.test(main), "页面：添加声音层按钮 + 音频选择框，可用性跟随添加图片");
   const sndKeys = [...main.matchAll(/et\(\s*"((?:snd)\.[\w.]+)"/g)].map((m) => m[1]).concat(["ly.addSound", "log.soundAdded", "log.soundEdited", "log.soundMissing", "log.soundFailed", "insp.sound"], sndMod.PLAYBACK_MODES.map((m) => `snd.mode.${m}`));
   const missingSnd = [...new Set(sndKeys)].filter((k) => (i18n.match(new RegExp(`"${k.replace(/\./g, "\\.")}":`, "g")) ?? []).length !== 2);
@@ -4984,6 +5057,38 @@ section("CONTAINER. 容器层 / 全屏后期层 / passthrough（M5 A12）");
 // ───────────────────────────────────────────────────────────────────────────
 section("J. 变异红测");
 {
+  {
+    // 媒体桥接：把「只认带 media 字段的报文」改回「每帧都 applyMedia」，
+    // AA3 的「频谱帧不得洗掉媒体状态」必须变红（否则封面上不来的 bug 会静默复发）。
+    const alPath = path.join(ROOT, "editor/audio-live.ts");
+    const alMutSrc = fs.readFileSync(alPath, "utf8");
+    const mutMedia = alMutSrc.replace(
+      "          if (msg.media !== undefined && msg.media !== null) applyMedia(msg.media);",
+      "          applyMedia(msg.media);",
+    );
+    check(mutMedia !== alMutSrc, "注入点存在（只在带 media 字段的报文中动媒体状态）");
+    const ma = await loadEditorModule("audio-live", { [alPath]: mutMedia });
+    const realES = globalThis.EventSource;
+    let inst = null;
+    class FakeES {
+      constructor(url) {
+        this.url = url;
+        inst = this;
+      }
+      close() {}
+    }
+    globalThis.EventSource = FakeES;
+    try {
+      const s = ma.createSystemAudioSource("");
+      s.start();
+      inst.onmessage({ data: JSON.stringify({ media: { hasMedia: true, title: "T", artist: "A", album: "B", hasArtwork: true } }) });
+      const got = s.media().snapshot.hasMedia === true;
+      inst.onmessage({ data: JSON.stringify({ audio: { bands: [255, 0, 0] } }) });
+      check(got && s.media().snapshot.hasMedia === false, "去掉「只认带 media 字段的报文」后频谱帧会洗掉媒体状态（判据变红）");
+    } finally {
+      globalThis.EventSource = realES;
+    }
+  }
   {
     const rcPath = path.join(ROOT, "editor/recover.ts");
     const rcSrc = fs.readFileSync(rcPath, "utf8");

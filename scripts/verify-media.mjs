@@ -1080,11 +1080,48 @@ const { check, errors } = createChecker();
   // 接线：soundCtl.play/stop 必须带 markPlayed/markStopped；自动开播路径不得带；
   // currentMediaDriver 的回落链必须包含壁纸音频
   const smSrc = fs.readFileSync(join(ROOT, "renderer/src/scene-mount.ts"), "utf8");
+  const shellSrc = fs.readFileSync(join(ROOT, "renderer/src/shell.ts"), "utf8");
   check(
     (smSrc.match(/wallpaperAudio\.markPlayed\(au\)/g) || []).length === 1,
     "soundCtl.play 应恰好调用一次 markPlayed（自动开播路径不得调用）",
   );
   check((smSrc.match(/wallpaperAudio\.markStopped\(au\)/g) || []).length === 1, "soundCtl.stop 应调用 markStopped");
+  // 释放系统「正在播放」槽位：媒体元素只要还挂着 src 就占着系统媒体会话（暂停 /
+  // muted / 增益归零都不放手），只有 removeAttribute("src") + load() 才当场释放。
+  // 预览页占住槽位 → 媒体桥读到的是「WebWallGL 编辑器」而不是用户播放器 → 封面全丢。
+  check(
+    /const unloadSound = \(au: HTMLAudioElement\) => \{[\s\S]{0,700}?au\.removeAttribute\("src"\);[\s\S]{0,200}?au\.load\(\)/.test(smSrc),
+    "声音层必须有 unloadSound（removeAttribute('src') + load()）来释放系统媒体会话",
+  );
+  check(
+    /if \(soundArmed\.has\(au\)\) unloadSound\(au\)/.test(smSrc),
+    "soundCtl.stop 必须对「可听过」的元素卸 src 释放槽位",
+  );
+  check(
+    /else if \(soundArmed\.has\(au\)\) \{\s*unloadSound\(au\);/.test(smSrc) &&
+      /if \(v > 0\) \{\s*soundArmed\.add\(au\);/.test(smSrc),
+    "setSceneVolume：v>0 记 armed、转静音卸 src；从未可听过的元素不动（不打断自带播放面板）",
+  );
+  // 暂停同样要交还槽位：paused 的元素仍占着系统条目（实测只把状态写成 paused），
+  // 所以 soundCtl.pause 与引擎 pauseImpl/resumeImpl 也必须 release/reclaim。
+  check(
+    /pause\(\) \{\s*soundWant\.delete\(au\);\s*au\.pause\(\);[\s\S]{0,300}?if \(soundArmed\.has\(au\)\) unloadSound\(au\);/.test(smSrc),
+    "soundCtl.pause 也必须卸 src（暂停的元素仍占着系统「正在播放」槽位）",
+  );
+  check(
+    /releaseSlots: \(\) => \{\s*for \(const au of soundAudios\) if \(soundArmed\.has\(au\)\) unloadSound\(au\);/.test(smSrc) &&
+      /reclaimSlots: \(\) => \{[\s\S]{0,200}?reloadSound\(au\);/.test(smSrc),
+    "sceneAudio 必须暴露 releaseSlots / reclaimSlots（暂停交还、恢复装回）",
+  );
+  check(
+    /playingAudios\.push\(au\);[\s\S]{0,200}?au\.pause\(\);[\s\S]{0,200}?rt\.sceneAudio\?\.releaseSlots\?\.\(\)/.test(smSrc) &&
+      /rt\.sceneAudio\?\.reclaimSlots\?\.\(\);[\s\S]{0,200}?for \(const au of playingAudios\) void au\.play\(\)/.test(smSrc),
+    "引擎 pauseImpl 必须 releaseSlots、resumeImpl 必须在重新 play 前 reclaimSlots",
+  );
+  check(
+    /releaseSlots\?: \(\) => void;/.test(shellSrc) && /reclaimSlots\?: \(\) => void;/.test(shellSrc),
+    "shell.ts Runtime.sceneAudio 类型必须声明 releaseSlots/reclaimSlots",
+  );
   check(/wallpaperAudio\.register\(au, layer\.name/.test(smSrc), "声音图层装配应登记进壁纸音频媒体源");
   check(
     /wallpaperAudio\.hasCurrent\(\) \? wallpaperAudio : null\) \?\? simMedia/.test(smSrc),
@@ -1995,6 +2032,201 @@ function sniffMediaType(url) {
     );
     check(/mediaHostCtl\?:/.test(shSrc), "shell.ts 必须声明 Runtime.mediaHostCtl（控制面存档位）");
   }
+}
+
+// ---------- 12. 在线封面源：播放器不给封面时的兜底（host/artwork-online.ts） ----------
+{
+  // 实测：汽水音乐只写 Now Playing 的标题/歌手，不提供 ArtworkData（Chromium 的
+  // mediaSession.metadata.artwork 也不会变成 MediaRemote 的封面）⇒ 只能按歌名+歌手
+  // 去公开曲库补一张。这组判据锁三件事：默认开 / 可关、不匹配就不贴图、只缓存真图片。
+  const { build } = await import("esbuild");
+  const out = await build({
+    entryPoints: [join(ROOT, "host/artwork-online.ts")],
+    bundle: true,
+    write: false,
+    format: "esm",
+    platform: "node",
+    target: "es2022",
+  });
+  const tmp = join(ROOT, "scripts", `.tmp-artwork-${process.pid}.mjs`);
+  fs.writeFileSync(tmp, out.outputFiles[0].text);
+  let art;
+  try {
+    art = await import(pathToFileURL(tmp).href);
+  } finally {
+    fs.unlinkSync(tmp);
+  }
+
+  const jpeg = Buffer.concat([Buffer.from([0xff, 0xd8, 0xff, 0xe0]), Buffer.alloc(2_000, 7)]);
+  const png = Buffer.concat([Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]), Buffer.alloc(2_000, 3)]);
+  const imgRes = (buf, mime = "image/jpeg") => ({
+    ok: true,
+    status: 200,
+    headers: { get: (n) => (String(n).toLowerCase() === "content-type" ? mime : null) },
+    json: async () => ({}),
+    arrayBuffer: async () => buf.buffer.slice(buf.byteOffset, buf.byteOffset + buf.byteLength),
+  });
+  const jsonRes = (payload) => ({
+    ok: true,
+    status: 200,
+    headers: { get: (n) => (String(n).toLowerCase() === "content-type" ? "application/json" : null) },
+    json: async () => payload,
+    arrayBuffer: async () => new ArrayBuffer(0),
+  });
+  const badRes = { ok: false, status: 404, headers: { get: () => null }, json: async () => ({}), arrayBuffer: async () => new ArrayBuffer(0) };
+  const stub = () => {
+    const calls = [];
+    const reqs = [];
+    const routes = new Map();
+    return {
+      calls,
+      reqs,
+      routes,
+      f: async (url, init) => {
+        calls.push(url);
+        reqs.push({ url, method: init?.method, body: init?.body });
+        if (!routes.has(url)) throw new Error(`未预期的请求：${url}`);
+        return routes.get(url);
+      },
+    };
+  };
+
+  // 12a. 开关：默认开，显式关闭才关（照抄 forbidden 里的「不许用启发式代替作者意图」同理：兜底必须可关）
+  check(art.onlineArtworkEnabled({}) === true, "在线封面默认开启（旧行为：播放器不给就永远没有封面）");
+  for (const v of ["0", "off", "false", "no", "OFF"]) {
+    check(art.onlineArtworkEnabled({ WE_ONLINE_ARTWORK: v }) === false, `WE_ONLINE_ARTWORK=${v} 必须关闭在线封面`);
+  }
+  check(art.onlineArtworkEnabled({ WE_ONLINE_ARTWORK: "1" }) === true, "WE_ONLINE_ARTWORK=1 保持开启");
+
+  // 12b. 匹配：歌名相等 2 / 互为子串 1 / 歌手命中 +0.5；对不上一律 0
+  check(art.matchScore("忘了", "AKA时空恋人", "忘了", "AKA时空恋人") === 2.5, "歌名+歌手全等 = 2.5 分");
+  check(art.matchScore("忘了 (R&B氛围版)", "AKA时空恋人", "忘了", "AKA时空恋人") === 2.5, "歌名的括号注记必须先归一化掉再比对");
+  check(art.matchScore("忘了", "", "忘了 (Live)", "") === 2, "无歌手信息时按歌名匹配即可");
+  check(art.matchScore("忘了", "AKA时空恋人", "别的歌", "AKA时空恋人") === 0, "歌名不同 = 0 分");
+  const picked = art.pickBest({ title: "忘了", artist: "AKA时空恋人" }, [
+    { title: "忘了", artist: "别人", url: "u-noartist" },
+    { title: "忘了", artist: "AKA时空恋人", url: "u-exact" },
+    { title: "忘了你", artist: "AKA时空恋人", url: "u-prefix" },
+  ]);
+  check(picked && picked.url === "u-exact" && picked.score === 2.5, "pickBest 选歌名+歌手都命中的那张");
+  check(
+    art.pickBest({ title: "忘了", artist: "AKA" }, [{ title: "别的歌", artist: "AKA", url: "u" }]) === null,
+    "歌名对不上就返回 null（宁可没封面，也不贴别首歌的图）",
+  );
+
+  // 12c. 字节校验：只认真图片
+  check(art.sniffImageMime(jpeg) === "image/jpeg" && art.sniffImageMime(png) === "image/png", "JPEG / PNG 魔数识别");
+  check(art.sniffImageMime(Buffer.from("<html>nope</html>".repeat(200))) === null, "HTML 错误页不得当封面");
+
+  // 12d. 多店铺汇总：华语曲目只在 TW 店铺能查到（CN 实测返回空），且翻唱版歌手不同
+  //      只能排在正版之后 —— 所以必须「全查 + 按分排序」，不能谁先返回就用谁。
+  const term = encodeURIComponent("AKA时空恋人 忘了");
+  const twUrl = `https://itunes.apple.com/search?term=${term}&entity=song&limit=8&country=TW`;
+  const usUrl = `https://itunes.apple.com/search?term=${term}&entity=song&limit=8&country=US`;
+  const bigUrl = "https://is1.mzstatic.com/image/thumb/x/600x600bb.jpg";
+  const r1 = stub();
+  r1.routes.set(
+    twUrl,
+    jsonRes({
+      results: [
+        { trackName: "忘了", artistName: "AKA时空恋人", artworkUrl100: "https://is1.mzstatic.com/image/thumb/x/100x100bb.jpg" },
+        { trackName: "忘了 (Live)", artistName: "别人", artworkUrl100: "https://is1.mzstatic.com/image/thumb/y/100x100bb.jpg" },
+      ],
+    }),
+  );
+  r1.routes.set(usUrl, jsonRes({ resultCount: 0, results: [] }));
+  r1.routes.set(`https://api.deezer.com/search?q=${term}&limit=8`, jsonRes({ data: [] }));
+  r1.routes.set(bigUrl, imgRes(jpeg));
+  const hit1 = await art.lookupOnlineArtwork({ title: "忘了", artist: "AKA时空恋人" }, { fetchImpl: r1.f });
+  check(!!hit1 && hit1.provider === "itunes" && hit1.mime === "image/jpeg" && hit1.data.length === jpeg.length, "iTunes 命中：返回图片字节与 mime");
+  check(r1.calls.includes(twUrl) && r1.calls.includes(usUrl), "iTunes 必须同时查 TW 与 US 店铺（CN 店铺查不到华语曲目）");
+  check(!r1.calls.some((u) => u.includes("country=CN")), "不得再查实测返回空的 CN 店铺");
+  check(r1.calls.filter((u) => u === bigUrl).length === 1 && !r1.calls.some((u) => u.includes("100x100bb")), "只下载 600x600 大图，且同一张不重复下载");
+
+  // 12e. 首选候选的图下载失败 → 用次优候选 / Deezer 兜底
+  const dzCover = "https://cdn-images.dzcdn.net/images/cover/x/1000x1000-000000-80-0-0.jpg";
+  const r2 = stub();
+  r2.routes.set(twUrl, jsonRes({ results: [{ trackName: "忘了", artistName: "AKA时空恋人", artworkUrl100: "https://is1.mzstatic.com/image/thumb/z/100x100bb.jpg" }] }));
+  r2.routes.set(usUrl, jsonRes({ resultCount: 0, results: [] }));
+  r2.routes.set("https://is1.mzstatic.com/image/thumb/z/600x600bb.jpg", badRes);
+  r2.routes.set(
+    `https://api.deezer.com/search?q=${term}&limit=8`,
+    jsonRes({ data: [{ title: "忘了", artist: { name: "AKA时空恋人" }, album: { cover_xl: dzCover } }] }),
+  );
+  r2.routes.set(dzCover, imgRes(png, "image/png"));
+  const hit2 = await art.lookupOnlineArtwork({ title: "忘了", artist: "AKA时空恋人" }, { fetchImpl: r2.f });
+  check(!!hit2 && hit2.provider === "deezer" && hit2.mime === "image/png", "首选候选的图下不来时必须回落到下一个源");
+
+  // 12e2. 华语独立音乐：iTunes / Deezer 全空时，网易云（POST cloudsearch）必须接住
+  const neteaseUrl = "https://music.163.com/api/cloudsearch/pc";
+  const neCover = "http://p2.music.126.net/0iDI54NMlaPIQN2QCppcCw==/109951173729227270.jpg";
+  const neBig = "https://p2.music.126.net/0iDI54NMlaPIQN2QCppcCw==/109951173729227270.jpg?param=600y600";
+  const r5 = stub();
+  r5.routes.set(twUrl, jsonRes({ resultCount: 0, results: [] }));
+  r5.routes.set(usUrl, jsonRes({ resultCount: 0, results: [] }));
+  r5.routes.set(`https://api.deezer.com/search?q=${term}&limit=8`, jsonRes({ data: [] }));
+  r5.routes.set(
+    neteaseUrl,
+    jsonRes({
+      result: {
+        songs: [
+          { name: "忘了", ar: [{ name: "AKA时空恋人" }], al: { picUrl: neCover } },
+          { name: "别的歌", ar: [{ name: "别人" }], al: { picUrl: "http://p2.music.126.net/other==/1.jpg" } },
+        ],
+      },
+    }),
+  );
+  r5.routes.set(neBig, imgRes(png, "image/png"));
+  const hit5 = await art.lookupOnlineArtwork({ title: "忘了", artist: "AKA时空恋人" }, { fetchImpl: r5.f });
+  const neReq = r5.reqs.find((r) => r.url === neteaseUrl);
+  check(!!hit5 && hit5.provider === "netease", "iTunes / Deezer 都查不到时必须由网易云接住（华语独立音乐覆盖率最好）");
+  check(!!neReq && neReq.method === "POST" && String(neReq.body ?? "").includes(`s=${term}`), "网易云查询必须是 POST，且关键词在表单体里（含 type/limit）");
+  check(r5.calls.includes(neBig) && !r5.calls.includes(neCover), "网易云封面必须换成 https + 600y600 再下载（原图是 120×120 缩略）");
+
+  // 12f. 失败与边界：不抛异常、不伪造、空歌名不联网
+  const down = { f: async () => { throw new Error("network down"); } };
+  check((await art.lookupOnlineArtwork({ title: "忘了", artist: "A" }, { fetchImpl: down.f })) === null, "全部源失败 → null（不抛异常、不伪造封面）");
+  let calledEmpty = 0;
+  const emptyStub = { f: async () => { calledEmpty++; throw new Error("x"); } };
+  check((await art.lookupOnlineArtwork({ title: "   " }, { fetchImpl: emptyStub.f })) === null && calledEmpty === 0, "空歌名不联网");
+
+  // 12g. 磁盘缓存：往返 / 过期 / 损坏 / 假图片
+  const cacheDir = join(ROOT, "scripts", `.tmp-artwork-cache-${process.pid}`);
+  const env = { WE_ARTWORK_CACHE_DIR: cacheDir };
+  const key = art.onlineArtworkCacheKey({ title: "忘了 (R&B氛围版)", artist: "AKA时空恋人", album: "X" });
+  check(
+    key === art.onlineArtworkCacheKey({ title: "忘了", artist: "AKA 时空恋人", album: "x" }),
+    "缓存键按归一化歌名+歌手+专辑生成（同一首写成两种样子也命中同一张）",
+  );
+  await art.writeOnlineArtworkCache(key, { data: jpeg, mime: "image/jpeg", provider: "itunes", matched: "忘了 — AKA时空恋人", url: bigUrl }, { env });
+  const back = await art.readOnlineArtworkCache(key, { env });
+  check(!!back && back.data.equals(jpeg) && back.provider === "cache", "在线封面磁盘缓存往返（重启不再联网）");
+  check((await art.readOnlineArtworkCache(key, { env, maxAgeMs: -1 })) === null, "缓存过期即视为未命中");
+  await art.writeOnlineArtworkCache(key, { data: Buffer.alloc(2_000, 1), mime: "image/jpeg", provider: "itunes", matched: "", url: "" }, { env });
+  check((await art.readOnlineArtworkCache(key, { env })) === null, "缓存里没有图片魔数 → 拒绝（不把错误页当封面）");
+  fs.writeFileSync(art.onlineArtworkCacheFile(key, env), "{ not json");
+  check((await art.readOnlineArtworkCache(key, { env })) === null, "缓存损坏不炸：当未命中重查");
+  fs.rmSync(cacheDir, { recursive: true, force: true });
+
+  // 12h. 宿主接线：system-live 必须在「播放器没给封面」这一支走在线源，并把标志翻起来
+  const liveSrc = fs.readFileSync(join(ROOT, "host/system-live.ts"), "utf8");
+  check(
+    /\} else \{\s*\/\/ 播放器不给封面[\s\S]{0,160}?void refreshOnlineArtwork\(snap\);/.test(liveSrc),
+    "system-live：播放器没给封面这一支必须发起在线封面查询",
+  );
+  check(/service\.media = \{ \.\.\.service\.media, hasArtwork: true \}/.test(liveSrc), "在线封面命中后必须把 hasArtwork 翻成 true（前端据此换 /api/system/artwork）");
+  check(
+    /if \(!onlineArtworkEnabled\(\)\) return;/.test(liveSrc) && /if \(onlineArtworkKey === key\) return;/.test(liveSrc),
+    "在线封面必须可关（WE_ONLINE_ARTWORK=0）且同一首歌只查一次",
+  );
+  check(
+    /readOnlineArtworkCache\(cacheKey\)/.test(liveSrc) && /writeOnlineArtworkCache\(cacheKey, art\)/.test(liveSrc),
+    "在线封面必须走磁盘缓存（不在每首歌上反复联网）",
+  );
+  check(
+    /serviceArtwork = null;\s*artworkReadPath = "";\s*onlineArtworkKey = "";/.test(liveSrc),
+    "曲目清空时必须丢掉封面与「已查过」记号（换歌重新判定）",
+  );
 }
 
 if (errors.length) {
