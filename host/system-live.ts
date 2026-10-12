@@ -22,6 +22,13 @@ import { access, readFile } from "node:fs/promises";
 import { resolve } from "node:path";
 import { promisify } from "node:util";
 import { installedMediaBridgePath } from "./media-bridge-release.mjs";
+import {
+  lookupOnlineArtwork,
+  onlineArtworkCacheKey,
+  onlineArtworkEnabled,
+  readOnlineArtworkCache,
+  writeOnlineArtworkCache,
+} from "./artwork-online";
 
 const execFileAsync = promisify(execFile);
 
@@ -87,6 +94,8 @@ export type CachedArtwork = {
 let serviceArtwork: CachedArtwork | null = null;
 /** 已读过的封面文件，避免 track/artwork 事件重复读盘 */
 let artworkReadPath = "";
+/** 已发起过在线封面查询的曲目键：同一首歌只查一次（播放事件每 ~1s 一条） */
+let onlineArtworkKey = "";
 
 const EMPTY_WINDOW: LiveWindowSnap = { app: "", title: "", url: "" };
 
@@ -258,6 +267,10 @@ function applyNow(now: unknown) {
 
   if (o.hasMedia !== true || !track || stateStr === "stopped") {
     service.media = { ...EMPTY_MEDIA };
+    // 曲目没了就一并丢掉封面与「已查过」的记号，下一首重新判定
+    serviceArtwork = null;
+    artworkReadPath = "";
+    onlineArtworkKey = "";
     return;
   }
 
@@ -291,6 +304,37 @@ function applyNow(now: unknown) {
   // 封面落盘在 media-bridge 缓存目录，直接读文件进内存（HTTP 端点只读缓存）
   if (artwork && typeof artwork.path === "string") {
     void refreshArtwork(String(artwork.path), String(artwork.mime ?? "image/jpeg"));
+  } else {
+    // 播放器不给封面（实测汽水音乐不写 ArtworkData）→ 按歌名+歌手去公开曲库补一张
+    void refreshOnlineArtwork(snap);
+  }
+}
+
+/**
+ * 在线封面兜底：只在播放器没给封面、且本曲还没查过时发起一次。
+ * 查不到就保持「无封面」（绝不伪造），查到了才把 hasArtwork 翻成 true —— 前端据此
+ * 换 /api/system/artwork 的 URL，编辑器与壁纸都走同一条通道。
+ */
+async function refreshOnlineArtwork(snap: LiveMediaSnap) {
+  if (!onlineArtworkEnabled()) return;
+  const title = snap.title.trim();
+  if (!title) return;
+  const key = `${snap.title}|${snap.artist}|${snap.album}`;
+  if (serviceArtwork?.key === key) return;
+  if (onlineArtworkKey === key) return;
+  onlineArtworkKey = key;
+  const cacheKey = onlineArtworkCacheKey({ title, artist: snap.artist, album: snap.album });
+  try {
+    const cached = await readOnlineArtworkCache(cacheKey);
+    const art = cached ?? (await lookupOnlineArtwork({ title, artist: snap.artist, album: snap.album }));
+    if (!art) return;
+    // 查询期间可能已经换歌：只认当前曲目
+    if (`${service.media.title}|${service.media.artist}|${service.media.album}` !== key) return;
+    serviceArtwork = { mime: art.mime, data: art.data, key };
+    if (!cached) void writeOnlineArtworkCache(cacheKey, art);
+    service.media = { ...service.media, hasArtwork: true };
+  } catch {
+    /* 在线源失败 = 无封面，交给前端回落默认外观 */
   }
 }
 
@@ -305,7 +349,8 @@ async function refreshArtwork(path: string, mime: string) {
       key: `${service.media.title}|${service.media.artist}|${service.media.album}`,
     };
   } catch {
-    /* 封面文件暂时读不到（竞态/权限）就等下一个事件 */
+    /* 封面文件暂时读不到（竞态/权限）就等下一个事件；实在没有就走在线源 */
+    void refreshOnlineArtwork(service.media);
   }
 }
 
