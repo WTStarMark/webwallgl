@@ -84,7 +84,14 @@ const todo = PACKAGES.filter((p) => {
   console.log(`跳过 ${p.pkg.name}@${version}：已发布`);
   return false;
 });
-if (!todo.length) throw new Error(`三个包的 ${version} 都已发布过 —— npm 不允许同版本覆盖，先升版本再发布`);
+if (!todo.length) {
+  // CI 由打标签触发：本机已手动发完同版本时标签照推，不算失败
+  if (ci) {
+    console.log(`三个包的 ${version} 都已发布，无事可做`);
+    process.exit(0);
+  }
+  throw new Error(`三个包的 ${version} 都已发布过 —— npm 不允许同版本覆盖，先升版本再发布`);
+}
 
 if (dryRun) {
   console.log(`--dry-run：跳过登录检查，只看打包清单（${version}）`);
