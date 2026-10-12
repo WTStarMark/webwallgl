@@ -424,6 +424,37 @@ const names = (calls) => calls.map((c) => c.name);
   check(mjs.replace(" || singleSub?.normals || null", " || null") !== mjs, "注入点存在（单子网格法线回落）");
 }
 
+// ───────────────── ⑬ 贴图通道子网格（puppettexturechannels）不当普通几何画 ─────────────────
+//
+// 3441873795 的 Kirby puppet：mesh1 的材质是 `puppettexturechannels`（两只闭眼贴图，眨眼用），
+// 顶点是**未居中**的贴图像素坐标（比主网格整体偏了半个图层尺寸），颜色要按动画权重叠到 uv2
+// 指向的眼睛区域。本仓没有实现该机制，当普通网格画 ⇒ 图层右上角多出两块缩小的 Kirby 碎片
+// （puppet 跑效果链时采样的是整层链尾纹理）。宿主标 `textureChannelOverlay`，绘制与蒙皮顶点都跳过。
+{
+  const SK = await import(pathToFileURL(join(ROOT, "renderer/vendor/we-scene/render/mdl-skin.js")).href);
+  const m0 = fakeMesh(); m0.indexCount = 3;
+  const m1 = fakeMesh(); m1.indexCount = 6; m1.textureChannelOverlay = true;
+  const multi = { ...fakeMDL(), meshes: [m0, m1] };
+  const gl = makeMockGL();
+  const r = createMDLRenderer(gl);
+  gl.__log.length = 0;
+  r.draw(MVP, multi, {}, null);
+  const seq = gl.__log.filter((c) => c.name === "drawElements").map((c) => c.args[1]);
+  check(JSON.stringify(seq) === "[3]",
+    `贴图通道子网格被当普通几何画了：实测 drawElements ${JSON.stringify(seq)}（应只画主网格 [3]；3441873795 右上角多出 Kirby 碎片）`);
+  check(SK.skinnedMeshes(multi, null, false).length === 1, "skinnedMeshes 没排除贴图通道子网格（拾取/轮廓会把图层右上角算进去）");
+  m1.textureChannelOverlay = false;
+  gl.__log.length = 0;
+  r.draw(MVP, multi, {}, null);
+  check(gl.__log.filter((c) => c.name === "drawElements").length === 2, "未标记时两个子网格都画（标记是唯一开关）");
+
+  const hostSrc = fs.readFileSync(join(ROOT, "renderer/src/scene-mount.ts"), "utf8");
+  check(/=== "puppettexturechannels"\) \{\s*meshes\[mi\]\.textureChannelOverlay = true;/.test(hostSrc),
+    "宿主没按材质 shader 标 textureChannelOverlay");
+  const calls = hostSrc.match(/await markTextureChannelOverlays\(mdlObj\);/g) || [];
+  check(calls.length === 2, `markTextureChannelOverlays 的装配接线不是 2 处（实测 ${calls.length}：puppet / mesh 两条路径各一处，3441873795 走 puppet 路径）`);
+}
+
 console.log(
   errors.length === 0
     ? "verify-mdl-depth: 全部通过 ✓"

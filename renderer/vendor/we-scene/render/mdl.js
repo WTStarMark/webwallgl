@@ -784,7 +784,7 @@ export function createMDLRenderer(gl) {
         // 绘制顺序由 meshDrawOrder 决定（F50）；单网格/未给排序表时 gi === k（逐位不变）。
         const gi = order ? order[k] : k
         const mesh = list ? list[gi] : legacyMesh
-        if (!mesh || !mesh.vertexCount || !mesh.indexCount) continue
+        if (!mesh || !mesh.vertexCount || !mesh.indexCount || mesh.textureChannelOverlay) continue
         const m = ensureMesh(mesh)
         gl.bindVertexArray(m.vao)
         // 带法线且场景有光 → 走上光路径（片元里 N·L）；否则常量 1（逐位等价旧行为）

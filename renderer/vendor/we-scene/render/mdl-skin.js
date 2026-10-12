@@ -502,7 +502,7 @@ export function skinnedMeshes(mdl, skin, keepZ) {
   for (const me of list) {
     const n = me.vertexCount | 0
     const src = me.positions
-    if (!n || !src || !me.indices) continue
+    if (!n || !src || !me.indices || me.textureChannelOverlay) continue
     const pos = new Float32Array(n * 3)
     const bi4 = me.boneIdx
     const w4 = me.weights
