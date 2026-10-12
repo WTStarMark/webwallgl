@@ -1,6 +1,7 @@
 # npm 发布：push 无 v 前缀的版本标签（如 2.1.0、2.1.1-beta1）触发。
 #
-# 走 npm「可信发布」（Trusted Publishing / OIDC）：npmjs.com 包设置里登记
+# 库包是三个：webwallgl、@webwallgl/core、@webwallgl/editor（scripts/publish-npm.mjs 按序发布）。
+# 走 npm「可信发布」（Trusted Publishing / OIDC）：npmjs.com 上**每个包**的设置里登记
 # 仓库 + 本文件名（publish.yml），发布凭证由 GitHub OIDC 现场换取
 # （要求 npm >= 11.5.1），不需要 NPM_TOKEN secret。本文件改名的话，
 # npm 上的登记要同步改。

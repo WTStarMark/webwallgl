@@ -708,7 +708,7 @@ export type SceneInstance = {
   on<K extends keyof SceneEvents>(ev: K, fn: SceneEvents[K]): () => void;
 };
 
-// ─── 编辑器包（webwallgl/editor）E0 能力面 ───────────────────────────────
+// ─── 编辑器包（@webwallgl/editor）E0 能力面 ───────────────────────────────
 // docs/EDITOR-PLAN.md W1–W4 + W2a：只在编辑器包出口经 editorOf(instance) 取得，
 // 播放包的 SceneInstance 不加方法（播放宿主零感知）。
 
@@ -1225,7 +1225,7 @@ export type ScenePkgResult = {
   dropped: string[];
 };
 
-// ─── 公共包（webwallgl/core）引擎底座类型 ────────────────────────────────
+// ─── 公共包（@webwallgl/core）引擎底座类型 ────────────────────────────────
 // docs/EDITOR-PLAN.md §0.5：公共包只收「自包含、Node 可载、零装配依赖」的引擎
 // 底座面。类型跟着实现走：Pkg/Tex 与 vendor/we-scene/pkg/{container,texture}.js
 // 的返回对象逐字段对应，改实现必须同步这里（api/core.d.ts 手写契约引用它们）。

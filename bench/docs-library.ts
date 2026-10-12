@@ -113,8 +113,15 @@ export const LIBRARY_DOC: DocSection[] = [
       {
         k: "code",
         v: {
-          zh: `// 2) ESM CDN（jsDelivr，vite/webpack 之外的直引方式）\nimport { mount, httpSource } from "https://cdn.jsdelivr.net/npm/webwallgl@${version}/webwallgl.min.mjs";`,
-          en: `// 2) ESM CDN via jsDelivr (without a bundler)\nimport { mount, httpSource } from "https://cdn.jsdelivr.net/npm/webwallgl@${version}/webwallgl.min.mjs";`,
+          zh: `// 2) ESM CDN（jsDelivr，vite/webpack 之外的直引方式）\nimport { mount, httpSource } from "https://cdn.jsdelivr.net/npm/webwallgl@${version}/+esm";`,
+          en: `// 2) ESM CDN via jsDelivr (without a bundler)\nimport { mount, httpSource } from "https://cdn.jsdelivr.net/npm/webwallgl@${version}/+esm";`,
+        },
+      },
+      {
+        k: "p",
+        v: {
+          zh: "按需另装：@webwallgl/core（pkg / .tex 解码与适配数学，零依赖、Node 可用）；@webwallgl/editor（编辑器 API，含 webwallgl 全部导出，自动装上同版本 webwallgl）。",
+          en: "Optional packages: @webwallgl/core (pkg / .tex decoding and fit math, zero dependencies, works in Node); @webwallgl/editor (editor API, re-exports all of webwallgl and installs the matching webwallgl version).",
         },
       },
       {

@@ -11,6 +11,8 @@ import { minRawJsPlugin } from "./scripts/lib/min-raw-plugin.mjs";
 const here = (p: string) => fileURLToPath(new URL(p, import.meta.url));
 
 const DIST = here("dist");
+// scripts/build-lib.mjs 的三个 npm 包目录（webwallgl / @webwallgl/core / @webwallgl/editor）
+const LIB_DIRS = new Set(["lib", "lib-core", "lib-editor"]);
 
 /**
  * dist/ 是**共享目录**：站点产物写根（assets/ / index.html / renderer/…），库产物在
@@ -29,7 +31,7 @@ function cleanSiteOutput(): Plugin {
     buildStart() {
       if (!existsSync(DIST)) return;
       for (const entry of readdirSync(DIST)) {
-        if (entry === "lib") continue; // 库产物：宿主 file: 依赖的落点，不许碰
+        if (LIB_DIRS.has(entry)) continue; // 库产物：lib 是宿主 file: 依赖的落点，不许碰
         rmSync(join(DIST, entry), { recursive: true, force: true });
       }
     },

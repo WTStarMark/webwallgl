@@ -1,4 +1,4 @@
-// WebWallGL 公共包出口（npm 子路径 webwallgl/core，产物形态见 docs/EDITOR-PLAN.md §0.5）。
+// WebWallGL 公共包出口（npm 包 @webwallgl/core，产物形态见 docs/EDITOR-PLAN.md §0.5）。
 //
 // 定位：引擎底座 —— 容器/纹理解码与适配数学这些「自包含、Node 可载、零装配依赖」
 // 的纯函数，供播放包、编辑器包与外部工具（缩略图、素材检查器、离线转码）共用。

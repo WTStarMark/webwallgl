@@ -1,17 +1,19 @@
 #!/usr/bin/env node
 /**
- * 库构建：三包产物（docs/EDITOR-PLAN.md §0.5），播放包 → 公共包 → 编辑器包顺序执行。
+ * 库构建：三个 npm 包（docs/EDITOR-PLAN.md §0.5），各写各的目录：
+ *   dist/lib/         webwallgl          播放包（宿主 WallpaperEM 的 file: 依赖落点，路径不能动）
+ *   dist/lib-core/    @webwallgl/core    引擎底座（pkg/.tex 解码、fitWindow），自包含 ESM
+ *   dist/lib-editor/  @webwallgl/editor  编辑器增量；`webwallgl` 走 external，不再内联第二份引擎
  *
- * 为什么是脚本而不是 `vite -c` 配置文件：Vite 6 的配置文件只接受单对象（数组导出
- * 报 "config must export or return an object"），而三包共用 dist/lib 且**只允许第一包
- * 清空目录**（后两包追加，否则互删）—— 用 JS API 顺序调用最直接，也免去 shell 里
- * 串三条 vite 命令。每个配置必须 configFile:false，否则会自动加载 vite.config.ts
+ * 为什么是脚本而不是 `vite -c` 配置文件：Vite 6 的配置文件只接受单对象，多次构建用 JS API
+ * 顺序调用最直接。每个配置必须 configFile:false，否则会自动加载 vite.config.ts
  * （站点构建配置）把 editor/main 全卷进来。
  *
- * 三个 bundle 各自内联全部依赖（不共享 chunk）：根出口保持与单入口时代同构
- * （桌面 App 的 file: 依赖零风险），子路径可单独 CDN 直引；代价是 npm 包多两份
- * 引擎拷贝，与「四份格式拷贝」的既有发布习惯一致。公共/编辑器包只有 ESM。
- * 压缩版由 scripts/assemble-lib.mjs 用 esbuild 二次生成。
+ * 发布体积约束（npm 包曾到 38 MB）：
+ *   - 不出 sourcemap（npm 不带 .map）；
+ *   - 播放包 ESM 把 mediabunny 留给 bundler（作为 dependency 安装）；UMD 是 <script> CDN
+ *     入口，没有模块解析，只能内联；
+ *   - 只出可读 ESM（bundler 自行压缩）与 UMD；UMD 由 assemble-lib.mjs 压成 .min 后删掉可读版。
  */
 import { build } from "vite";
 import { fileURLToPath } from "node:url";
@@ -19,8 +21,9 @@ import { glslPlugin, embeddedGlslPlugin } from "./lib/glsl-plugin.mjs";
 import { minRawJsPlugin } from "./lib/min-raw-plugin.mjs";
 
 const entry = (p) => fileURLToPath(new URL(`../renderer/src/api/${p}`, import.meta.url));
+const PLAYER_ENTRY = entry("index.ts");
 
-const base = {
+const base = (outDir, emptyOutDir, external = []) => ({
   configFile: false,
   publicDir: false, // 库产物不带 public/（降级页等属宿主资产）
   // .glsl 独立文件在打包期转 JS 模块并剥掉 GLSL 注释/空行（issue #14）；
@@ -28,63 +31,73 @@ const base = {
   plugins: [glslPlugin(), embeddedGlslPlugin(), minRawJsPlugin()],
   build: {
     target: "es2022",
-    outDir: "dist/lib",
+    outDir,
+    emptyOutDir,
     minify: false,
-    sourcemap: true,
+    sourcemap: false,
+    rollupOptions: { external },
   },
+});
+
+const isMediabunny = (id) => id === "mediabunny" || id.startsWith("mediabunny/");
+
+// 编辑器包里 `export * from "./index"` 指向播放包公共面 —— 改写成对 webwallgl 的外部引用，
+// 否则 rollup 会把整个播放引擎再打一遍
+function playerAsExternal() {
+  return {
+    name: "we-player-external",
+    enforce: "pre",
+    async resolveId(source, importer, opts) {
+      if (source === "webwallgl") return { id: "webwallgl", external: true };
+      if (!importer || !source.startsWith(".")) return null;
+      const r = await this.resolve(source, importer, { ...opts, skipSelf: true });
+      if (r && r.id === PLAYER_ENTRY) return { id: "webwallgl", external: true };
+      return null;
+    },
+  };
+}
+
+// ① 播放包 ESM（webwallgl.mjs，npm + bundler 主路径）。唯一清空 dist/lib 的构建。
+const playerEs = base("dist/lib", true, isMediabunny);
+playerEs.build.lib = {
+  entry: PLAYER_ENTRY,
+  formats: ["es"],
+  fileName: () => "webwallgl.mjs",
 };
 
-// ① 播放包（根出口，向后兼容；桌面 App 的 file: 依赖走它，行为不变）
-//    webwallgl.mjs（ESM，npm + bundler 主路径）+ webwallgl.global.js（UMD，全局
-//    变量 WebWallGL，<script> CDN 入口）。唯一 emptyOutDir 的构建。
-const player = {
-  ...base,
-  build: {
-    ...base.build,
-    emptyOutDir: true,
-    lib: {
-      entry: entry("index.ts"),
-      name: "WebWallGL",
-      formats: ["es", "umd"],
-      fileName: (format) => (format === "es" ? "webwallgl.mjs" : "webwallgl.global.js"),
-    },
-  },
+// ② 播放包 UMD（全局变量 WebWallGL，<script> CDN 入口）：依赖全部内联
+const playerUmd = base("dist/lib", false);
+playerUmd.build.lib = {
+  entry: PLAYER_ENTRY,
+  name: "WebWallGL",
+  formats: ["umd"],
+  fileName: () => "webwallgl.global.js",
 };
 
-// ② 公共包（webwallgl/core）：引擎底座（pkg/.tex 解码、fitWindow），自包含 ESM
-const core = {
-  ...base,
-  build: {
-    ...base.build,
-    emptyOutDir: false,
-    lib: {
-      entry: entry("core.ts"),
-      formats: ["es"],
-      fileName: () => "webwallgl-core.mjs",
-    },
-  },
+// ③ 公共包（@webwallgl/core）
+const core = base("dist/lib-core", true);
+core.build.lib = {
+  entry: entry("core.ts"),
+  formats: ["es"],
+  fileName: () => "webwallgl-core.mjs",
 };
 
-// ③ 编辑器包（webwallgl/editor）：播放包超集，自包含 ESM
-const editor = {
-  ...base,
-  build: {
-    ...base.build,
-    emptyOutDir: false,
-    lib: {
-      entry: entry("editor.ts"),
-      formats: ["es"],
-      fileName: () => "webwallgl-editor.mjs",
-    },
-  },
+// ④ 编辑器包（@webwallgl/editor）：播放面从 webwallgl re-export，自身只含编辑器实现
+const editor = base("dist/lib-editor", true, isMediabunny);
+editor.plugins = [playerAsExternal(), ...editor.plugins];
+editor.build.lib = {
+  entry: entry("editor.ts"),
+  formats: ["es"],
+  fileName: () => "webwallgl-editor.mjs",
 };
 
 for (const [name, cfg] of [
-  ["① 播放包（webwallgl，ES+UMD）", player],
-  ["② 公共包（webwallgl/core，ESM）", core],
-  ["③ 编辑器包（webwallgl/editor，ESM）", editor],
+  ["① 播放包 ESM（webwallgl）", playerEs],
+  ["② 播放包 UMD（webwallgl）", playerUmd],
+  ["③ 公共包（@webwallgl/core）", core],
+  ["④ 编辑器包（@webwallgl/editor）", editor],
 ]) {
   console.log(`[build-lib] ${name} …`);
   await build(cfg);
 }
-console.log("[build-lib] 三包构建完成 → dist/lib/");
+console.log("[build-lib] 三包构建完成 → dist/lib/ · dist/lib-core/ · dist/lib-editor/");

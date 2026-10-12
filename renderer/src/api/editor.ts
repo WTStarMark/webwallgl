@@ -1,4 +1,5 @@
-// WebWallGL 编辑器包出口（npm 子路径 webwallgl/editor，产物形态见 docs/EDITOR-PLAN.md §0.5）。
+// WebWallGL 编辑器包出口（npm 包 @webwallgl/editor，产物形态见 docs/EDITOR-PLAN.md §0.5）。
+// 发布构建里 `./index` 被改写成对 webwallgl 的外部引用，本包只带编辑器增量。
 //
 // 定位：编辑器使能层，播放包的**超集** —— EDITOR-PLAN 里程碑 E0–E3 的编辑器 API
 // （可控时钟、场景图可变、拾取、单帧出图、保存链路、效果库）全部落在本文件与

@@ -21,11 +21,13 @@ WebWallGL 是一个用 WebGL2 在浏览器里播放 Wallpaper Engine 壁纸的�
 pnpm add webwallgl   # 或 npm i webwallgl
 ```
 
+另有两个按需安装的包：`@webwallgl/core`（pkg / .tex 解码与适配数学，零依赖，可在 Node 里用）、`@webwallgl/editor`（编辑器 API，包含 `webwallgl` 的全部导出，会自动装上同版本的 `webwallgl`）。
+
 也可以不经打包器，直接走 CDN：
 
 ```html
 <script type="module">
-  import { mount, httpSource } from "https://cdn.jsdelivr.net/npm/webwallgl/webwallgl.min.mjs";
+  import { mount, httpSource } from "https://cdn.jsdelivr.net/npm/webwallgl/+esm";
 </script>
 <!-- 或 UMD，暴露全局 WebWallGL -->
 <script src="https://cdn.jsdelivr.net/npm/webwallgl/webwallgl.global.min.js"></script>
@@ -148,11 +150,13 @@ WebWallGL is a WebGL2 rendering core that plays Wallpaper Engine wallpapers in t
 pnpm add webwallgl   # or npm i webwallgl
 ```
 
+Two more packages are available on demand: `@webwallgl/core` (pkg / .tex decoding and fit math, zero dependencies, works in Node) and `@webwallgl/editor` (the editor API; re-exports everything from `webwallgl` and installs the matching `webwallgl` version automatically).
+
 Or skip the bundler and use a CDN:
 
 ```html
 <script type="module">
-  import { mount, httpSource } from "https://cdn.jsdelivr.net/npm/webwallgl/webwallgl.min.mjs";
+  import { mount, httpSource } from "https://cdn.jsdelivr.net/npm/webwallgl/+esm";
 </script>
 <!-- or UMD, exposing the global WebWallGL -->
 <script src="https://cdn.jsdelivr.net/npm/webwallgl/webwallgl.global.min.js"></script>

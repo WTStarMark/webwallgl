@@ -918,12 +918,15 @@ check(
   );
 
   // 门禁 20.1：构建产物剥掉 GLSL 注释/空行（契约注释保留，署名注释随工程自包含）
-  if (fs.existsSync("dist/lib")) {
+  const libDirs = ["dist/lib", "dist/lib-core", "dist/lib-editor"].filter((d) => fs.existsSync(d));
+  if (libDirs.length) {
     const distHits = [];
-    for (const f of fs.readdirSync("dist/lib")) {
-      if (!/\.(?:mjs|js)$/.test(f)) continue;
-      const txt = fs.readFileSync(path.join("dist/lib", f), "utf8");
-      if (/\/\/[ \t]*原作作者|\/\/[ \t]*版权与出处/.test(txt)) distHits.push(f + "（署名注释残留）");
+    for (const dir of libDirs) {
+      for (const f of fs.readdirSync(dir)) {
+        if (!/\.(?:mjs|js)$/.test(f)) continue;
+        const txt = fs.readFileSync(path.join(dir, f), "utf8");
+        if (/\/\/[ \t]*原作作者|\/\/[ \t]*版权与出处/.test(txt)) distHits.push(`${dir}/${f}（署名注释残留）`);
+      }
     }
     check(distHits.length === 0, "构建产物剥掉 GLSL 注释/空行（契约注释保留）", distHits.join(","));
   }
