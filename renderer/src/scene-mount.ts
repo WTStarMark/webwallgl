@@ -4161,7 +4161,7 @@ export function mountScene(rt: Runtime, cfg: WallpaperConfig) {
       // 贴图像素坐标，颜色要按动画权重叠到 uv2 指向的区域；本仓未实现该机制，当普通网格画会在
       // 图层右上角多出一块（3441873795）。权重 0（静止态）时官方也不出像素，故标记后不画。
       // 两条模型装载路径都要调用（puppet 路径不读子网格材质）。
-      const markTextureChannelOverlays = async (mdlObj: any) => {
+      const markTextureChannelOverlays = async (layer: any, mdlObj: any) => {
         const meshes = mdlObj?.meshes;
         if (!meshes || meshes.length < 2) return;
         for (let mi = 1; mi < meshes.length; mi++) {
@@ -4171,6 +4171,7 @@ export function mountScene(rt: Runtime, cfg: WallpaperConfig) {
           const shader = entry ? readMaterialDoc(entry)?.passes?.[0]?.shader : undefined;
           if (typeof shader === "string" && shader.toLowerCase() === "puppettexturechannels") {
             meshes[mi].textureChannelOverlay = true;
+            reportDiag(rt, cfg, `model '${layer.name}' 跳过贴图通道子网格 mesh${mi}（${mp}）`, "info");
           }
         }
       };
@@ -4220,7 +4221,7 @@ export function mountScene(rt: Runtime, cfg: WallpaperConfig) {
           }
           layer.puppet = mdlObj;
           await wireMaskTextures(layer, mdlObj);
-          await markTextureChannelOverlays(mdlObj);
+          await markTextureChannelOverlays(layer, mdlObj);
           // 编辑器只读面（getModelInfo）用：模型来自哪里、各子网格实际加载的贴图
           (layer as any).modelSrc = {
             form: "puppet",
@@ -4472,7 +4473,7 @@ export function mountScene(rt: Runtime, cfg: WallpaperConfig) {
           // [we-scene patch 2026-10-12] 掩码贴图（见 `wireMaskTextures`）：这条网格/材质
           // 路径与 puppet 路径**都必须接**，否则掩码通道在另一条路径上静默失效。
           await wireMaskTextures(layer, mdlObj);
-          await markTextureChannelOverlays(mdlObj);
+          await markTextureChannelOverlays(layer, mdlObj);
           layer.puppet = mdlObj;
           (layer as any).modelSrc = { form: "mesh", mdlPath: layer.model, jsonPath: null, textures: meshTexNames };
           mdlItems.push({ mdl: mdlObj, tex: texObj, layer });

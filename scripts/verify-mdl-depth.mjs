@@ -31,7 +31,7 @@
 import fs from "node:fs";
 import { join } from "node:path";
 import { pathToFileURL } from "node:url";
-import { ROOT, createChecker } from "./lib/verify-kit.mjs";
+import { ROOT, itemDir, createChecker } from "./lib/verify-kit.mjs";
 
 const { check, errors } = createChecker({ echo: true });
 
@@ -451,8 +451,36 @@ const names = (calls) => calls.map((c) => c.name);
   const hostSrc = fs.readFileSync(join(ROOT, "renderer/src/scene-mount.ts"), "utf8");
   check(/=== "puppettexturechannels"\) \{\s*meshes\[mi\]\.textureChannelOverlay = true;/.test(hostSrc),
     "宿主没按材质 shader 标 textureChannelOverlay");
-  const calls = hostSrc.match(/await markTextureChannelOverlays\(mdlObj\);/g) || [];
+  const calls = hostSrc.match(/await markTextureChannelOverlays\(layer, mdlObj\);/g) || [];
   check(calls.length === 2, `markTextureChannelOverlays 的装配接线不是 2 处（实测 ${calls.length}：puppet / mesh 两条路径各一处，3441873795 走 puppet 路径）`);
+
+  // 真机语料（本机壁纸库有 3441873795 才跑；真实数据核对思路来自 PR #15，@WTStarMark）：
+  // 「跳过」的物理依据——mesh1 是两张闭眼图的 1:1 覆盖片，不是几何。
+  const pkgPath = join(itemDir("3441873795"), "scene.pkg");
+  if (!fs.existsSync(pkgPath)) {
+    console.log(`  · 跳过真机语料（未找到 ${pkgPath}；设 WE_LIBRARY 指向壁纸库根即可启用）`);
+  } else {
+    const { parsePkg, getEntry } = await import(pathToFileURL(join(ROOT, "renderer/vendor/we-scene/pkg/container.js")).href);
+    const { parseMDL } = await import(pathToFileURL(join(ROOT, "renderer/vendor/we-scene/render/mdl-parse.js")).href);
+    const { parseTex, decodeMip0 } = await import(pathToFileURL(join(ROOT, "renderer/vendor/we-scene/pkg/texture.js")).href);
+    const pkg = parsePkg(new Uint8Array(fs.readFileSync(pkgPath)));
+    const shaderOf = (mp) => {
+      const raw = mp && getEntry(pkg, mp);
+      return raw ? JSON.parse(new TextDecoder().decode(raw))?.passes?.[0]?.shader ?? null : null;
+    };
+    const kirby = parseMDL(getEntry(pkg, "models/Kirby_puppet.mdl").slice());
+    check(kirby.meshes?.length === 2, `真机语料：Kirby 应为 2 个子网格（实测 ${kirby.meshes?.length}）`);
+    check(shaderOf(kirby.meshes[0].materialPath) === "genericimage3", "真机语料：mesh0 是美术件（genericimage3），不能被标记");
+    check(shaderOf(kirby.meshes[1].materialPath) === "puppettexturechannels", "真机语料：mesh1 的 shader 应为 puppettexturechannels");
+    const cm = decodeMip0(parseTex(getEntry(pkg, "materials/Kirby_channelmap.tex").slice(), { name: "Kirby_channelmap.tex" }));
+    const p = kirby.meshes[1].positions;
+    const quadW = [0, 4].map((o) => Math.abs(p[o * 3 + 3] - p[o * 3]));
+    check(cm.width === 226 && quadW[0] + quadW[1] === cm.width,
+      `真机语料：两个四边形宽度之和应等于 channelmap 宽度（${quadW.join("+")} vs ${cm.width}）`);
+    check(Math.abs(kirby.meshes[1].uvs[2] - quadW[0] / cm.width) < 1e-3, "真机语料：UV 切分点应落在 第一片宽/channelmap 宽");
+    const b0 = kirby.bounds;
+    check(p[0] > b0.minX && p[1] > b0.maxY, "真机语料：mesh1 停在主网格包围盒右上方之外（未居中的贴图像素坐标）");
+  }
 }
 
 console.log(
