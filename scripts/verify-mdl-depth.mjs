@@ -287,8 +287,12 @@ const names = (calls) => calls.map((c) => c.name);
 {
   // 去注释再断言：把 discard 注释掉（本仓排查时的常见手法）必须照样转红
   const msrc = fs.readFileSync(join(ROOT, "renderer/vendor/we-scene/render/mdl.js"), "utf8").replace(/\/\/[^\n]*/g, "");
-  check(/if \(t\.a \* u_color\.a < 0\.004\) discard;/.test(msrc),
-    "模型片元着色器没有丢弃全透明像素：alpha=0 的卡片留白仍会写深度，把身后几何拒成黑块（F50）");
+  // [we-scene patch 2026-10-12] 丢弃阈值里多了 `v_alpha`（每骨不透明度包络的顶点 alpha，
+  // 官方 genericimage4.frag 的 `color.a *= v_VertexAlpha`）：闭眼时作者把眼球骨画到 0，
+  // 顶点 alpha 就把整块零件判成全透明。判据必须跟着走 —— 少了这一项等于「被包络隐藏的
+  // 零件仍然写深度」，那才是把身后几何拒成黑块的那条缺陷。
+  check(/if \(t\.a \* u_color\.a \* v_alpha < 0\.004\) discard;/.test(msrc),
+    "模型片元着色器没有丢弃全透明像素（含每骨 alpha）：alpha=0 的卡片留白 / 被包络淡出的零件仍会写深度，把身后几何拒成黑块（F50）");
   check(/function meshDrawOrder/.test(msrc), "缺少 meshDrawOrder（F50 排序实现）");
   check(/opts\.keepZ \? meshDrawOrder\(list, opts\.meshBlending\) : null/.test(msrc),
     "排序没有按 keepZ 门控（2D 场景会被重排，绘制顺序即合成顺序）");

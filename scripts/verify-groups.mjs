@@ -678,11 +678,46 @@ check(wallpapers.length > 100, `壁纸库样本过少: ${wallpapers.length}`);
     check(compose.length >= 2, `3798926489 应有 ≥2 个空组合层+效果，实得 ${compose.length}`);
     for (const L of compose) {
       check(!L.passthrough, `${L.name}#${L.id} 作者没写 config.passthrough，不应靠旗标`);
+      check(!L.copybackgroundExplicit, `${L.name}#${L.id} 作者没写 copybackground 键`);
       check(layerWantsComposeBackdrop(L),
         `${L.name}#${L.id} 应走 compose backdrop（空画布会盖住故障背景）`);
     }
   } else {
     check(false, "库里应有 3798926489（GlitchGirl 空组合层回读样本）");
+  }
+
+  // E3. 作者显式关掉「复制背景」的空组合层**不能**回读身后画面。
+  // 3351179520（麻匪 東京喰种 高槻泉 媒体识别）的 393 是 circular_text(RETAIN:1)
+  // + spin + perspective 的环文字层，作者把 copybackground 写成 false；回读身后
+  // 画面会让 perspective 把整块背景副本重映射成一个斜置大面板（官方 f0 没有），
+  // 也就是用户报的「组 4785 缩放、位置错误」。3798926489 的 crt/vhs/vignette
+  // 没写这个键（作者要的正是背景回读），所以判据只能认显式 false。
+  check(layerWantsComposeBackdrop({ isContainer: true, hasChildren: false }) === true,
+    "空组合层（未写 copybackground）仍应回读身后画面");
+  check(layerWantsComposeBackdrop({ isContainer: true, hasChildren: false, copybackground: true }) === true,
+    "copybackground:true 的空组合层应回读身后画面");
+  check(layerWantsComposeBackdrop({ isContainer: true, hasChildren: false, copybackground: false, copybackgroundExplicit: true }) === false,
+    "copybackground:false 的空组合层必须用空画布（否则背景副本被效果链重映射）");
+  check(layerWantsComposeBackdrop({ isContainer: true, hasChildren: false, copybackground: false }) === true,
+    "只是解析默认值（没这个键）时仍须回读身后画面");
+  check(/layer\.copybackgroundExplicit\s*&&\s*layer\.copybackground\s*===\s*false/.test(rsrc),
+    "layerWantsComposeBackdrop 必须只认作者显式写的 copybackground === false");
+  check(/copybackgroundExplicit:\s*o\.copybackground\s*!==\s*undefined/.test(
+    await import("node:fs").then((fs) => fs.promises.readFile("renderer/vendor/we-scene/scene/parse.js", "utf8"))),
+    "parse.js 必须保留 copybackground 是否显式写入（copybackgroundExplicit）");
+  const wpMedia = wallpapers.find((w) => w.id === "3351179520");
+  if (wpMedia) {
+    const parsed = parseScene(wpMedia.scene, {});
+    const compose = parsed.layers.filter((l) => l.isContainer && !l.hasChildren
+      && l.copybackgroundExplicit && l.copybackground === false && (l.effects || []).some((e) => e.visible !== false));
+    check(compose.length >= 2, `3351179520 应有 ≥2 个 copybackground:false 的空组合层，实得 ${compose.length}`);
+    for (const L of compose) {
+      check(!layerWantsComposeBackdrop(L),
+        `${L.name}#${L.id} copybackground:false，不得回读身后画面`);
+    }
+    check(compose.some((L) => L.id === 393), "3351179520 的 393（环文字层）应在 copybackground:false 集合里");
+  } else {
+    check(false, "库里应有 3351179520（媒体识别组合层 copybackground:false 样本）");
   }
 }
 

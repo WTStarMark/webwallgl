@@ -4029,6 +4029,34 @@ export function mountScene(rt: Runtime, cfg: WallpaperConfig) {
         }
         return m;
       };
+      // [we-scene patch 2026-10-12] **MDL 掩码块的掩码贴图**（Puppet Warp Clipping Mask）。
+      // 掩码块只带材质名（`masks/clipping_mask_6cec714b`），贴图走 `materials/<名字>.tex`；
+      // 缺图（作者漏打包，如 3629379075 的 `masks/clipping_mask_d9c9ec64`）时给 null，
+      // 渲染侧回落白图（等价于不压 alpha）。
+      //
+      // ★**两条模型装载路径都要接**（下面 puppet 路径与网格/材质路径）：掩码贴图挂在
+      // `layer.maskTextures` 上，由 draw 的 opts 转发给渲染器；只接一条时另一条上的掩码
+      // 通道会**静默失效**（2026-10-12 实测：只接了网格路径 ⇒ 全部 WE 标准 puppet 的
+      // `maskTextures` 恒 undefined，掩码通道对所有壁纸都是空操作，靠插桩计数才查出来）。
+      const wireMaskTextures = async (layer: any, mdlObj: any) => {
+        const maskBlocks = mdlObj?.maskBlocks as Array<{ matPath?: string }> | null | undefined;
+        if (!maskBlocks || maskBlocks.length === 0) return;
+        const maskTexs: any[] = [];
+        for (const blk of maskBlocks) {
+          const name = typeof blk?.matPath === "string" ? blk.matPath : "";
+          if (!name) {
+            maskTexs.push(null);
+            continue;
+          }
+          try {
+            await loadTex(name);
+            maskTexs.push(textures.get(name) || null);
+          } catch {
+            maskTexs.push(null);
+          }
+        }
+        layer.maskTextures = maskTexs;
+      };
       // 同粒子：隐藏层也要装 puppet，否则 combo 热切显示后骨骼模型仍是空的。
       for (const layer of scene.layers) {
         if (!layer.image) continue;
@@ -4074,6 +4102,7 @@ export function mountScene(rt: Runtime, cfg: WallpaperConfig) {
             continue;
           }
           layer.puppet = mdlObj;
+          await wireMaskTextures(layer, mdlObj);
           // 编辑器只读面（getModelInfo）用：模型来自哪里、各子网格实际加载的贴图
           (layer as any).modelSrc = {
             form: "puppet",
@@ -4322,6 +4351,9 @@ export function mountScene(rt: Runtime, cfg: WallpaperConfig) {
             (layer as any).meshMaterials = meshSpecs;
             (layer as any).meshBlending = meshBlend;
           }
+          // [we-scene patch 2026-10-12] 掩码贴图（见 `wireMaskTextures`）：这条网格/材质
+          // 路径与 puppet 路径**都必须接**，否则掩码通道在另一条路径上静默失效。
+          await wireMaskTextures(layer, mdlObj);
           layer.puppet = mdlObj;
           (layer as any).modelSrc = { form: "mesh", mdlPath: layer.model, jsonPath: null, textures: meshTexNames };
           mdlItems.push({ mdl: mdlObj, tex: texObj, layer });
@@ -4400,9 +4432,11 @@ export function mountScene(rt: Runtime, cfg: WallpaperConfig) {
               {
                 time: o.time,
                 animLayers: layer.animationLayers,
-                // [we-scene patch 2026-10-07] 眼睑盖住眼球时同步压扁。不再按壁纸 ID 开关，
-                // 收口在 collapsedPartSquash（眼组网格 vs 全身网格的尺寸）。
-                syncCoveredParts: (mdl as any).shouldSyncCoveredParts?.(cfg.src) ?? false,
+                // [we-scene patch 2026-10-12] 「眼睑盖住眼球 → 同步压扁」由 mdl.js 的
+                // collapsedPartSquash 启发式负责的时代结束：官方机制是**每骨不透明度
+                // 包络**（MDLA blend_curves → genericimage4.vert 的 g_BonesAlpha[] →
+                // 顶点 alpha → 片元 color.a *= v_VertexAlpha），已由 mdl.js 的
+                // computeBoneAlphas + 顶点/片元着色器逐位实现，无需宿主传开关。
                 // [we-scene patch] 脚本层的骨骼平移覆写（thisLayer.setBoneTransform）。
                 // 骨骼拖拽壁纸的 puppet 动画数为 0，蒙皮完全由脚本驱动，
                 // 所以这个表是它们唯一的形变来源。
@@ -4413,6 +4447,11 @@ export function mountScene(rt: Runtime, cfg: WallpaperConfig) {
                 // [we-scene patch 2026-09-28] 逐子网格贴图（见挂载里 model 分支）。
                 // 缺席时 mdl 渲染器逐网格回落到整层贴图，单网格模型行为不变。
                 meshTextures: (layer as any).meshTextures || null,
+                // [we-scene patch 2026-10-12] **逐掩码贴图**（MDL 掩码块 / Puppet Warp
+                // Clipping Mask）。官方 clippingmaskimage4.frag 的 g_Texture1 就是它；
+                // 掩码块只给材质名（如 `masks/clipping_mask_6cec714b`），贴图按
+                // `materials/<名字>.tex` 取（解析见挂载里 model 分支）。
+                maskTextures: (layer as any).maskTextures || null,
                 // [we-scene patch 2026-10-04] 逐子网格 blending（F50 排序用）与天空盒标记（F49）。
                 // **这两个字段必须在这里透传**：renderer 那侧虽然把 `skybox`/`meshBlending`
                 // 塞进了 puppetDrawFn 的 opts，但真正调 `mdlRenderer.draw` 的是本回调、

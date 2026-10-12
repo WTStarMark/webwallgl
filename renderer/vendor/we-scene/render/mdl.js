@@ -1,5 +1,5 @@
 // [we-scene patch] MDL（Puppet Warp 骨骼网格）解析与渲染
-// 格式（逆向自本机壁纸库 23 个 MDLV0023 模型，全部校验通过）：
+// 格式（依据本机壁纸库 23 个 MDLV0023 模型实测得到，全部校验通过）：
 //   MDLV0023 头
 //     0x00  char[8]   "MDLV0023"
 //     0x15  cstr      材质路径（如 "materials/01腿-后.json"）
@@ -36,7 +36,7 @@
 // 以下 re-export 维持既有 import 方（main.ts / verify-*.mjs）的路径不变。
 import { parseMDL } from './mdl-parse.js'
 import { linkProgram } from './gl-util.js'
-import { computeSkinMatrices, bindWorldOf, mat4MulOut, attachmentWorld, attachmentBind, attachmentEffectiveOffset, parentMeshToWorldDelta, applyAttachmentBindOrigins, followAttachments, skinnedMeshes } from './mdl-skin.js'
+import { computeSkinMatrices, computeBoneAlphas, bindWorldOf, mat4MulOut, attachmentWorld, attachmentBind, attachmentEffectiveOffset, parentMeshToWorldDelta, applyAttachmentBindOrigins, followAttachments, skinnedMeshes } from './mdl-skin.js'
 import { IDENTITY } from './mdl-math.js'
 
 
@@ -51,7 +51,11 @@ const MAX_BONES_FLOOR = 24
 
 function boneBudget(gl) {
   const vecs = gl.getParameter(gl.MAX_VERTEX_UNIFORM_VECTORS) || 256
-  const usable = Math.floor((vecs - 32) / 4)
+  // [we-scene patch 2026-10-12] 每骨 1 个 mat4（4 个 vec4）+ 1 个 float（u_boneAlpha）。
+  // 标量数组按 4 个元素占一个 vec4 计 ⇒ 每骨 4.25；这里按「每个标量元素独占一个 vec4」
+  // 保守取 5，避免驱动链接失败。本机上报 1024 个 vec4，(1024-32)/5 = 198 > 硬上限 128，
+  // 所以本机骨预算与改动前逐位一致；只有 < 640 个 vec4 的设备才会少几根骨。
+  const usable = Math.floor((vecs - 32) / 5)
   return Math.max(MAX_BONES_FLOOR, Math.min(MAX_BONES_HARD_CAP, usable))
 }
 
@@ -75,12 +79,21 @@ uniform mat3 u_normalMat;
 uniform mat4 u_skin[${maxBones}];
 uniform int u_boneCount;
 uniform float u_keepZ;
-uniform vec2 u_partScale;
-uniform vec2 u_partPivot;
+// [we-scene patch 2026-10-12] 每骨不透明度包络 = 官方 WE 的「眨眼 / 零件淡出」机制。
+// 官方 genericimage4.vert（SKINNING_ALPHA combo，见 ModelCompiler AddPuppetShaderInfo）：
+//   uniform float g_BonesAlpha[BONECOUNT];
+//   v_VertexAlpha *= saturate(g_BonesAlpha[a_BlendIndices.x]*a_BlendWeights.x
+//                             + .y*.y + .z*.z + .w*.w);
+// 片元侧 genericimage4.frag:194 的 color.a *= v_VertexAlpha 与本实现同义。
+// 数值由 mdl-skin.js 的 computeBoneAlphas 从 MDLA blend_curves 求得。
+// u_alphaOn = 0 时整段短路 ⇒ 与改动前逐位一致（没有曲线的模型照旧）。
+uniform float u_boneAlpha[${maxBones}];
+uniform float u_alphaOn;
 uniform mat4 u_model;
 out vec2 v_uv;
 out vec3 v_wnormal;
 out highp vec3 v_wpos;
+out float v_alpha;
 void main() {
   vec4 p = vec4(a_pos, 1.0);
   vec4 skinned = vec4(0.0);
@@ -96,8 +109,21 @@ void main() {
     }
   }
   vec4 local = total > 0.0 ? skinned / total : p;
-  // [we-scene patch 2026-09-28] 每零件竖直缩放（「被收拢的零件盖住」时同步压扁，见 collapsedPartSquash）
-  local.xy = u_partPivot + (local.xy - u_partPivot) * u_partScale;
+  // 每骨不透明度：该顶点骨骼 alpha 的**权重和**（官方公式原文，不除权重和；权重本身就
+  // 归一到 1）。u_alphaOn = 0 时恒 1.0。非蒙皮网格（u_boneCount = 0）不进这段。
+  float va = 1.0;
+  if (u_alphaOn > 0.5 && u_boneCount > 0) {
+    float acc = 0.0;
+    for (int i = 0; i < 4; i++) {
+      float w = a_weight[i];
+      if (w <= 0.0) continue;
+      int bi = int(a_bone[i]);
+      if (bi < 0 || bi >= u_boneCount) continue;
+      acc += u_boneAlpha[bi] * w;
+    }
+    va = clamp(acc, 0.0, 1.0);
+  }
+  v_alpha = va;
   vec4 lp = vec4(local.xy, local.z * u_keepZ, 1.0);
   gl_Position = u_mvp * lp;
   // 世界坐标只给场景雾用（官方 generic4.vert 的 v_ViewDir = g_EyePosition - worldPos）
@@ -118,6 +144,8 @@ const MDL_FRAG = `#version 300 es
 precision mediump float;
 in vec2 v_uv;
 in vec3 v_wnormal;
+// [we-scene patch 2026-10-12] 每骨不透明度（顶点侧加权和，官方 genericimage4 的 v_VertexAlpha）
+in float v_alpha;
 uniform sampler2D u_tex;
 uniform vec4 u_color;
 // [we-scene patch 2026-09-28] 场景光照（**只对带法线的真 3D 网格生效**）：
@@ -142,6 +170,23 @@ uniform highp vec4 u_fogDist;
 uniform vec3 u_fogDistColor;
 uniform highp vec4 u_fogHeight;
 uniform vec3 u_fogHeightColor;
+// [we-scene patch 2026-10-12] **Puppet Warp Clipping Mask**（官方 MDL 掩码块，见
+// mdl-parse.js 的 maskBlocks 与 parseMeshes 的掩码遍历）。官方实现：
+//   assets/shaders/clippingmaskimage4.frag：
+//     float mask = texSample2D(g_Texture1, v_TexCoord.xy).r;            // 掩码图
+//     color.a = mix(pow(albedoAlpha, 4.0), albedoAlpha, mask);          // 未覆盖处压 alpha
+//   掩码件（MaskBlock 的 b 列）负责把掩码图铺到屏幕上，被裁剪件（a 列）只在
+//   掩码件画到的地方可见 —— 作者正是用它做「眼睑合上时把眼球/虹膜裁掉」
+//   （ModelCompiler.cpp:1201-1310 的注释：later parts overdraw earlier ones =
+//   eyelid covering pupil at peak blink）。
+// 本实现（与官方「cheap composition / color max blending」同构）：
+//   1) 把 b 件用 u_maskWrite=1 画进一张屏幕空间的掩码缓冲，混合用 MAX 累积覆盖率；
+//   2) 画 a 件时把缓冲在**屏幕坐标**采样，乘进片元 alpha。
+// u_maskOn = 0 时两段都短路 ⇒ 与没有掩码块的模型逐位一致。
+uniform sampler2D u_maskTex;
+uniform float u_maskOn;
+uniform float u_maskWrite;
+uniform vec2 u_viewport;
 out vec4 fragColor;
 vec4 applySceneFog(vec4 c) {
   float fd = 0.0;
@@ -177,7 +222,16 @@ void main() {
   // 猫与城市之间的层间遮挡（F49）不受影响，作者画的柔边也保留。官方 generic4.frag
   // 的 ALPHATOCOVERAGE 分支做的是同一件事（阈值 0.5 + fwidth 抗锯齿），我们取更保守的
   // 阈值以免把柔边整圈削成硬边（官方那条留给 ALPHATOCOVERAGE combo 真正接上时再用）。
-  if (t.a * u_color.a < 0.004) discard;
+  if (t.a * u_color.a * v_alpha < 0.004) discard;
+  // 掩码写入趟：只输出「本件此刻的覆盖率」（官方 clippingmaskimage4.frag 的 alpha 公式
+  // mix(albedoAlpha^4, albedoAlpha, mask)），混合是 MAX ⇒ 重叠件取最大覆盖。
+  if (u_maskWrite > 0.5) {
+    float al = t.a * u_color.a * v_alpha;
+    float mtex = texture(u_maskTex, v_uv).r;
+    float am = mix(al * al * al * al, al, mtex);
+    fragColor = vec4(am, 0.0, 0.0, am);
+    return;
+  }
   vec3 mul = vec3(1.0);
   if (u_lightOn > 0.5) {
     vec3 n = normalize(v_wnormal);
@@ -187,355 +241,27 @@ void main() {
     // 与钳上界等价；HDR 场景则进 RGBA16F 交给 bloom/tonemap，与 WE 同一条路。
     mul = max(u_lightBase + u_lightAdd * ndl, 0.0);
   }
-  fragColor = t * u_color * vec4(mul, 1.0);
+  fragColor = t * u_color * vec4(mul, v_alpha);
+  // 被裁剪件：按**屏幕坐标**采样掩码缓冲（写入趟与本次绘制同 viewport、同 MVP，
+  // 所以 gl_FragCoord.xy / u_viewport 就是该缓冲的 uv）。
+  if (u_maskOn > 0.5) fragColor.a *= texture(u_maskTex, gl_FragCoord.xy / u_viewport).r;
   if (u_fogOn > 0.5) fragColor = applySceneFog(fragColor);
 }`
 
-// [we-scene patch 2026-10-07] 不再按壁纸 ID 开门。2026-09-28 的白名单只有两张，
-// 新眼组闭眼时眼球仍露在外面。全库 201 个带部件的 puppet 按「每根骨骼缩放幅度最低的一帧」
-// 重采样后，分水岭是网格静止长边：眼组图层最大 767（13眼组），全身/头发最小 1017（花火）。
-// 900 落在这道空隙里。全身网格只留下静止长边 ≤110 且同帧不超过 3 个的命中
-// （Lucy 62、蕾塞 79 是眼球；151px 的躯干块和花火脸上那一串都进不来）。
-/** 是否跑「被收拢的零件盖住 → 同步压扁」。收口在 collapsedPartSquash 里，不看壁纸 ID。 */
-export function shouldSyncCoveredParts(_workshopId) {
-  return true
-}
-
-
-/**
- * [we-scene patch 2026-09-28] 该网格是否出现**真正的零件塌陷**（高度压到静止的 80% 以下）。
- *
- * 为什么用它代替白名单：全库配对表（`docs/CASEBOOK.md`「配对表」小节）显示，
- * 「塌陷件↔刚性件」这种几何配对在身体/头发/披风里同样成立（15+ 张误伤），
- * 但**它们的覆盖件只是抖到 0.94~0.98**；而真正闭眼的眼睑是压到 **0.47~0.65**。
- * 也就是说「有没有零件被压扁」这件事本身就是分水岭——比任何尺寸/比例阈值都干净，
- * 而且不依赖壁纸 ID。判据只在能算出「深压」的网格上生效，其余模型零影响。
- * 结果按网格缓存（`mdl._deepCollapse`），只在首帧算一次（16 个采样点）。
- */
-function hasDeepPartCollapse(mdl, animLayers) {
-  if (mdl._deepCollapse !== undefined) return mdl._deepCollapse
-  mdl._deepCollapse = false
-  const parts = mdl.parts
-  if (!parts || parts.length < 2 || !mdl.animations.length) return false
-  const pos = mdl.positions
-  const idx = mdl.boneIdx
-  const wts = mdl.weights
-  // **不要**只用「当前可见的动画层」判定：脚本会在装配后改可见性/播放态，
-  // 首帧拿到的是空的层列表就会把 _deepCollapse 永久记成 false（实测 3655429099
-  // 因此「又没压扁」）。改为「配置层 + 每条 clip 单独」都扫一遍，结果取或。
-  const candidates = []
-  if (animLayers && animLayers.length) candidates.push(animLayers)
-  for (const a of mdl.animations) candidates.push([{ animation: a.id, visible: true, additive: false, blend: 1, rate: 1 }])
-  // 扫的时候**不能**动 mdl._skin：draw() 刚拿到的 skin 就是它的同一个引用，
-  // 覆盖了下游就会用错误姿势上传 uniform。临时换成独立缓冲，扫完还原。
-  const savedSkin = mdl._skin
-  mdl._skin = mdl._deepSkin || (mdl._deepSkin = new Float32Array(mdl.bones.length * 16))
-  try {
-    for (const layers of candidates) {
-      const maxDur = Math.max(1e-3, ...layers.map((L) => {
-        const a = mdl.animations.find((x) => x.id === L.animation)
-        return a ? a.duration : 0
-      }))
-      // 均匀 16 点会漏掉短眨眼：3808922316 的闭眼只有第 82–88 帧（0.2 秒），
-      // 10 秒片段上 16 个点全部落在窗外，深压被记成 false，之后整段动画都不再补偿。
-      // 每根骨骼再补它自己 |sx|/|sy| 最低的那一帧（眼睑经常压的是本地 X）。
-      const times = new Set()
-      for (let si = 0; si < 16; si++) times.add((maxDur * si) / 16)
-      for (const L of layers) {
-        const a = mdl.animations.find((x) => x.id === L.animation)
-        if (!a || !a.tracks) continue
-        const fps = a.fps > 0 ? a.fps : 30
-        for (const tr of a.tracks) {
-          const kf = tr.keyframes
-          if (!kf) continue
-          const n = tr.frameCount || kf.length / 9
-          let best = 1
-          let bestF = 0
-          for (let f = 0; f < n; f++) {
-            const mag = Math.min(Math.abs(kf[f * 9 + 7]), Math.abs(kf[f * 9 + 8]))
-            if (mag < best) { best = mag; bestF = f }
-          }
-          if (best < 0.85) times.add(bestF / fps)
-        }
-      }
-      for (const t of times) {
-        if (mdl._deepCollapse) break
-        computeSkinMatrices(mdl, t, layers)
-        const skin = mdl._skin
-        for (const part of parts) {
-          const restH = part.y1 - part.y0
-          if (!(restH > 1e-3)) continue
-          let y0 = Infinity
-          let y1 = -Infinity
-          for (let vi = 0; vi < part.verts.length; vi++) {
-            const v = part.verts[vi]
-            let y = 0
-            for (let k = 0; k < 4; k++) {
-              const w = wts[v * 4 + k]
-              if (!w) continue
-              const off = idx[v * 4 + k] * 16
-              y += w * (skin[off + 1] * pos[v * 3] + skin[off + 5] * pos[v * 3 + 1] + skin[off + 13])
-            }
-            if (y < y0) y0 = y
-            if (y > y1) y1 = y
-          }
-          if ((y1 - y0) / restH < 0.8) {
-            mdl._deepCollapse = true
-            break
-          }
-        }
-      }
-      if (mdl._deepCollapse) break
-    }
-  } catch {
-    mdl._deepCollapse = false
-  } finally {
-    mdl._skin = savedSkin
-  }
-  return mdl._deepCollapse
-}
-
-// 零件「收拢 / 刚性 / 被盖住」的阈值，见 collapsedPartSquash 头注
-// PART_SQUASH_ENTER：判定「被盖住」关系的入场阈值（只要有压缩就判，压缩比越小压得越狠）
-const PART_SQUASH_ENTER = 0.98
-const PART_RIGID_RATIO = 0.9
-const PART_ENCLOSE_Y = 0.9
-const PART_ENCLOSE_X = 0.6
-const PART_AREA_CAP = 6
-// 见文件上方 2026-10-07 注释。改这两个数之前先跑 verify-blink：
-// 眼组必须收到 k=0，花火/头发/躯干块必须一个零件都不压。
-const PART_SQUASH_MESH = 900
-const PART_SQUASH_BODY = 110
-// 全身网格上「大件也跟着收」的唯一破例：收拢件自己被压到这个比例以下（真闭眼）。
-// 3078285611/3264246690 的躯干/头板假阳性都是 cr=0.96~0.98（几乎没收）配上的，靠这条挡住；
-// 3671936032 的眼白 cr=0.075（艾玛 f24）、0.26（希罗 f60，侧脸只压到四分之一）要能放行。
-// 取 0.4 是为了容下希罗那 0.26；放到 0.9 会把 3078285611 静止长边 236 的零件压到 0.07（判据转红）。
-const PART_SQUASH_BODY_DEEP = 0.4
-
-function meshSpan(mdl) {
-  if (mdl._meshSpan) return mdl._meshSpan
-  let x0 = Infinity
-  let x1 = -Infinity
-  let y0 = Infinity
-  let y1 = -Infinity
-  for (const p of mdl.parts) {
-    if (p.x0 < x0) x0 = p.x0
-    if (p.x1 > x1) x1 = p.x1
-    if (p.y0 < y0) y0 = p.y0
-    if (p.y1 > y1) y1 = p.y1
-  }
-  mdl._meshSpan = { long: Math.max(x1 - x0, y1 - y0) }
-  return mdl._meshSpan
-}
-
-/**
- * [we-scene patch 2026-09-28] 「被收拢的零件盖住」的零件，本帧竖直压扁多少（对齐 mdl.parts，
- * 1 = 不压；返回 null 表示本帧不用改）。
- *
- * 为什么需要：3629379075（若叶睦 眨眼）的闭眼是把眼睑/睫毛零件**压扁成一条线**
- * （眼睑 60→25、上睫毛 43→…），而眼球零件 100% 绑在一根在四条 clip 里都恒定不动的骨上
- * （scale 恒 1.000、平移只动 8~11 单位）——文件里没有任何数据能让它消失或变形：
- * 无绘制顺序曲线、无 masks、无脚本驱动，MDLE 只是同一套绑定姿势换轴序（实测），
- * 每骨 skin pivot / 4×4 矩阵也都会推歪身体。但作者随包的 preview.gif 与工坊宣传图里
- * 闭眼时看不到眼球（同尺度实测闭/睁虹膜像素：作者 30%、我们 93%）。
- * 用户拍板的做法：**别藏，跟着同步压扁**——眼睑开始压缩时眼球就按同一进度变扁，
- * 压到一半时收完，全程连续、不跳变（藏掉会「漏眼睛」且眨眼不顺滑）。
- *
- * 判据（纯几何，静止帧零影响）：
- *   1. 某零件本帧压扁（高度比 < PART_SQUASH_ENTER）→ 它是「收拢件」；
- *   2. 另一个**刚性件**（本帧高度仍 > 静止的 90%）满足三条才判为被盖住：
- *      ① 收拢件的**中心**落在它的当前盒内（不用「90%/60% 包含」：左右眼原画形状可以不同，
- *         包含关系只对一只眼成立，实测 3655429099 只收一只眼）；
- *      ② 它的静止**宽度**小于收拢件（「眼睑宽 → 眼球窄」；这条同时排掉睫毛带，
- *         见下面命中循环里的长注）；
- *      ③ 它的当前面积不超过收拢件的 6 倍（挡掉「脸包住嘴」这类大容器）；
- *   3. 压扁系数 k = clamp(5r − 4, 0, 1)（r = 收拢件的高度比）：r≥1 不压、r=0.9 压到一半、
- *      r≤0.8 收完。阈值取 0.8 是因为**同一台里两只眼的眼睑压缩幅度可以不同**
- *      （3655429099 实测 0.66 / 0.74），阈值落在两者之间就只收一只眼。
- *   4. k < 0.25 直接**不画**（用户实测：完全闭眼时压扁的残留仍会露出来，要求压到一定程度就隐藏；
- *      回弹时 k 升过 0.25 又会自动出现，同一条判据双向适用）。
- * 恒等帧（静止、纯位移/旋转）在骨头缩放预筛处直接返回，零额外成本。
- * 不按壁纸 ID 开关：眼组网格（静止长边 ≤ PART_SQUASH_MESH）全部刚性命中都跟着压；
- * 更大的网格只压静止长边 ≤ PART_SQUASH_BODY 且同帧不超过 3 个的命中。
-
- */
-export function collapsedPartSquash(mdl, skin, animLayers) {
-  const parts = mdl.parts
-  if (!parts || parts.length < 2 || !skin) return null
-  if (!hasDeepPartCollapse(mdl, arguments[2])) return null // 行为命中：只有真出现「深压」的网格才参与
-  // 快速预筛：本帧有骨头缩放明显偏离 1 才值得逐零件算包围盒。
-  let scaled = false
-  for (let i = 0; i < mdl.bones.length; i++) {
-    const m = skin.subarray(i * 16, i * 16 + 16)
-    if (Math.abs(Math.hypot(m[0], m[1]) - 1) > 0.02 || Math.abs(Math.hypot(m[4], m[5]) - 1) > 0.02) {
-      scaled = true
-      break
-    }
-  }
-  if (!scaled) return null
-
-  const pos = mdl.positions
-  const idx = mdl.boneIdx
-  const wts = mdl.weights
-  const box = mdl._partBox && mdl._partBox.length === parts.length
-    ? mdl._partBox
-    : (mdl._partBox = parts.map(() => new Float32Array(5))) // x0,x1,y0,y1,ratio
-  for (let p = 0; p < parts.length; p++) {
-    const part = parts[p]
-    const b = box[p]
-    let x0 = Infinity
-    let x1 = -Infinity
-    let y0 = Infinity
-    let y1 = -Infinity
-    for (let vi = 0; vi < part.verts.length; vi++) {
-      const v = part.verts[vi]
-      let x = 0
-      let y = 0
-      for (let k = 0; k < 4; k++) {
-        const w = wts[v * 4 + k]
-        if (!w) continue
-        const off = idx[v * 4 + k] * 16
-        x += w * (skin[off] * pos[v * 3] + skin[off + 4] * pos[v * 3 + 1] + skin[off + 12])
-        y += w * (skin[off + 1] * pos[v * 3] + skin[off + 5] * pos[v * 3 + 1] + skin[off + 13])
-      }
-      if (x < x0) x0 = x
-      if (x > x1) x1 = x
-      if (y < y0) y0 = y
-      if (y > y1) y1 = y
-    }
-    const restH = part.y1 - part.y0
-    b[0] = Number.isFinite(x0) ? x0 : 0
-    b[1] = Number.isFinite(x1) ? x1 : 0
-    b[2] = Number.isFinite(y0) ? y0 : 0
-    b[3] = Number.isFinite(y1) ? y1 : 0
-    b[4] = restH > 1e-3 ? (b[3] - b[2]) / restH : 1
-  }
-
-  // 网格尺度提前取：大网格（long > PART_SQUASH_MESH，即整个人物）里的「大件」走下面
-  // 眼睛专属的硬条件；小网格（眼组，≤900px）里的零件沿用老的中心/相交判据。
-  const span = meshSpan(mdl)
-  const bigMesh = span.long > PART_SQUASH_MESH
-  const hits = []
-  for (let r = 0; r < parts.length; r++) {
-    const rb = box[r]
-    if (rb[4] < PART_RIGID_RATIO) continue
-    const rArea = Math.max(1e-6, (rb[1] - rb[0]) * (rb[3] - rb[2]))
-    const rp = parts[r]
-    const rLong = Math.max(rp.x1 - rp.x0, rp.y1 - rp.y0)
-    let k = 1
-    let px = 0
-    let py = 0
-    for (let c = 0; c < parts.length; c++) {
-      if (c === r) continue
-      const cb = box[c]
-      if (!(cb[4] < PART_SQUASH_ENTER)) continue
-      const h = cb[3] - cb[2]
-      const w = cb[1] - cb[0]
-      if (!(h > 1e-6) || !(w > 1e-6)) continue
-      // 面积上限的分母用**展开后**的面积：深压时收拢件的当前盒只剩一条线（3671936032 的
-      // 眼白 168×13），拿它当分母会把「本来就盖在上面的大件」（同一张的虹膜 444×217）全判掉。
-      const eh = h / Math.max(cb[4], 1e-3)
-      if (rArea > PART_AREA_CAP * Math.max(1e-6, w * eh)) continue
-      // 收口分两类。**大件** = 静止长边 > PART_SQUASH_BODY(110) 的零件（眼球/虹膜/躯干），
-      // 只有在整张人物网格（long > PART_SQUASH_MESH）里才另走硬条件；眼组小网格沿用老判据。
-      if (bigMesh && rLong > PART_SQUASH_BODY) {
-        // 眼睛这一处是**反过来的**：闭眼时收掉的是眼白（168×171 的小件），要跟着收的却是
-        // 横跨双眼的虹膜 444×217 与高光 432×166（3671936032，用户实测「眼球一直是最大状态、
-        // 睫毛往下运动时也没有被遮罩」）。虹膜比眼白宽、静止时与眼白不在同一块 UV 岛、当前盒
-        // 也错开，老判据一条都过不了。改用四条硬条件（缺一个就会把身体块当眼球，实测
-        // 3078285611 的 232×761 / 323×389 / 156×150 会分别被第三/第四/第二+第四条挡住）：
-        //   ① 两个零件**同属一颗骨**（bone.parent 相同）：艾玛的眼白/眼球/高光都是 bone 31 的
-        //      子骨、希罗的是 bone 61 的子骨 —— 这才是「同一只眼的零件」；
-        //   ② 收拢件**真的收完了**（cb[4] < PART_SQUASH_BODY_DEEP = 0.2；绘制侧 k<0.25 本来
-        //      就不画了）：身体块的假阳性 cr 都在 0.26~0.98；
-        //   ③ 两者**尺度相近**（静止两轴尺寸比 ≤ 4）：虹膜对眼白 2.6/1.3，而 232×761 对
-        //      186×179 在高度上是 4.3 倍；
-        //   ④ 被盖的大件比收拢件**本身大**（静止面积 ≥ 2 倍）：虹膜对眼白 3.4 倍，而
-        //      3078285611 里尺寸几乎一样的一对（156×150 对 151×137，1.1 倍）不是「盖住」。
-        if (!(cb[4] < PART_SQUASH_BODY_DEEP)) continue
-        const ownBone = mdl.bones[rp.bone]
-        const colBone = mdl.bones[parts[c].bone]
-        if (!(ownBone && colBone && ownBone.parent === colBone.parent)) continue
-        const rw0 = Math.max(1e-3, rp.x1 - rp.x0)
-        const rh0 = Math.max(1e-3, rp.y1 - rp.y0)
-        const cw0 = Math.max(1e-3, parts[c].x1 - parts[c].x0)
-        const ch0 = Math.max(1e-3, parts[c].y1 - parts[c].y0)
-        if (!(Math.max(rw0 / cw0, cw0 / rw0) <= 4 && Math.max(rh0 / ch0, ch0 / rh0) <= 4)) continue
-        // ④ 收拢件**此刻真的压在它身上**：当前姿势下两盒的交叠面积至少占较小者的 1/5。
-        //    这条取代了早先的「被盖件静止面积 ≥2 倍」—— 那条会把**比眼白小的眼球**挡在门外
-        //    （3671936032 希罗：眼球 49×153=7497 < 眼白 150×140=21000，面积比 0.36，
-        //    可它正是闭眼时该被盖住的那件，用户实测「眼球一直是最大状态、睫毛往下也没遮罩」）。
-        //    用「当前交叠」分辨真假：希罗眼球×眼白 交叠 2571（占较小者 34%）、艾玛虹膜×眼白
-        //    6804（61%），而 3078285611 的假配 #29(156×150) × #23(151×137, cr=0.002) 交叠 **0**
-        //    —— 已经塌成一条线的 #23（当前盒 151×0.22、X 在 329~480）压根没压到 #29（X 521~682）。
-        const ix = Math.min(cb[1], rb[1]) - Math.max(cb[0], rb[0])
-        const iy = Math.min(cb[3], rb[3]) - Math.max(cb[2], rb[2])
-        if (!(ix > 0 && iy > 0)) continue
-        if (ix * iy < 0.2 * Math.min(rArea, w * h)) continue
-      } else {
-        // 老判据（2026-10-07）：收拢件**当前中心**落在刚性件盒内 + 被盖件更窄 +（2026-10-09）
-        // 静止姿势下两盒**相交**。
-        // 不用「竖直 90%/横向 60% 包含」的原因：同一台壁纸的左右眼**原画形状可以不同**
-        // （3655429099 是 wink 角色，两眼素材不对称），包含判据只对一只眼成立 →
-        // 实测「一只眼收、另一只不收」。
-        // 相交那条是 2026-10-09 补的：中心判据对「被压成一条线的零件」是退化的 —— 13px 高的
-        // 细条照样包含任何跨越它的中心点，于是眼白塌成一条线时就"盖住"了静止姿势下毫无重叠的
-        // 睫毛（3671936032 艾玛 f24 / 希罗 f60），把闭眼时必须留下的深色睑线整块删掉
-        //（绘制侧 k<0.25 不画）→ 用户看到的「眨眼只有睫毛动、眼睛不闭」。
-        // 语料侧这条判据不动任何原有命中：静止重叠 3655429099 87~100%、3629379075 15~65%、
-        // 3808922316 54~95%、3521337568 37~83%、3791967416 9~64%、3264246690 53~60%。
-        const cx = (cb[0] + cb[1]) / 2
-        const cy = (cb[2] + cb[3]) / 2
-        if (cx < rb[0] || cx > rb[1] || cy < rb[2] || cy > rb[3]) continue
-        // **能盖住**：被盖件的当前宽度必须小于收拢件的**静止**宽度 —— 「眼睑/皮肤（宽）盖住
-        // 眼球（窄）」。这条是相对判据（两个零件互相比较），绝对判据全试过并且都失败：
-        //   静止更高：3655429099 眼球(70/67) 比眼睑(80) 矮 → 两颗眼都不命中（旧版的 bug）
-        //   静止面积更小：3629379075 眼睑 139×67 比眼球 91×107 还小 → 只剩一只眼
-        //   静止盒被包含：3655429099 右眼当前盒比眼睑高 33%，包含关系不成立 → 只剩左眼
-        // 而宽度关系两台都成立：眼球 82/54 < 眼睑 140/84；3629379075 眼球 91/90 < 眼睑 139。
-        const cRestW = parts[c].x1 - parts[c].x0
-        if (!((rb[1] - rb[0]) < cRestW)) continue
-        const cp = parts[c]
-        if (!(Math.min(cp.x1, rp.x1) > Math.max(cp.x0, rp.x0) &&
-              Math.min(cp.y1, rp.y1) > Math.max(cp.y0, rp.y0))) continue
-      }
-      // 同步压扁：k = clamp(5r − 4, 0, 1)，即眼睑压到 80% 起跟随、压到 80% 以下就收完。
-      // 为什么阈值取 0.8 而不是更小：同一台壁纸**两只眼的眼睑压缩程度并不相同**——
-      // 3655429099 实测 r=0.66 与 r=0.74（两声道的录制幅度不同），任何落在两者之间的阈值
-      // 都会只收一只眼（用户实测「只有左眼匹配上」）。取 0.8 让「眼睑明显压了」= 眼球收完。
-      // 3629379075（r 最低 0.40）在这条映射下同样收干净。
-      const kk = Math.max(0, Math.min(1, 5 * cb[4] - 4))
-      if (kk < k) {
-        k = kk
-        // 枢轴取**收拢件的当前中心**：被盖件往眼睑带里塌，而不是原地压缩成条纹
-        //（原地压缩时它的原画被压成一道道横纹，就是用户看到的「残影」）
-        px = (cb[0] + cb[1]) / 2
-        py = (cb[2] + cb[3]) / 2
-      }
-    }
-    if (k < 1) hits.push({ r, k, px, py })
-  }
-  // 高度 ≥ 最高命中件 60%：剔掉睫毛/高光这类小件（3629379075 里 h31/h37 丢掉，
-  // 只剩两颗眼球 h107/h104）。「同帧不超过 3 个」只用于全身网格，眼组不能用它收口。
-  if (!hits.length) return null
-  // 候选循环已经按网格尺度分好类（全身网格的大件走眼睛专属硬条件），这里只做高度收口。
-  // 先收口再取「高度 ≥ 最高命中 60%」的顺序不能反：全身网格上若先拿最高的躯干件当 100%，
-  // 79px 的眼球会被 60% 滤掉。
-  const tallest = Math.max(...hits.map((h) => parts[h.r].y1 - parts[h.r].y0))
-  const kept = hits.filter((h) => parts[h.r].y1 - parts[h.r].y0 >= 0.6 * tallest)
-  if (!kept.length) return null
-  // 个数看滤完高度之后的：Lucy 一帧能配上四五件，60% 之后剩 3 颗眼球。
-  // 花火滤完仍是 4~11 件、头发 11 件以上，整帧放弃，不要挑最高的三件（那不是眼球）。
-  if (span.long > PART_SQUASH_MESH && kept.length > 3) return null
-  const out = new Float32Array(parts.length * 3)
-  for (let i = 0; i < parts.length; i++) out[i * 3] = 1
-  for (const h of kept) {
-    out[h.r * 3] = h.k
-    out[h.r * 3 + 1] = h.px
-    out[h.r * 3 + 2] = h.py
-  }
-  return out
-}
+// [we-scene patch 2026-10-12] 这里原本是「被收拢的零件盖住 → 同步压扁 / 剔除」启发式
+// （shouldSyncCoveredParts / hasDeepPartCollapse / PART_SQUASH_* / meshSpan /
+//  collapsedPartSquash，约 345 行）。它用「零件本帧包围盒高度比」猜哪些零件该跟着淡出，
+// 判据随语料漂移 —— 这正是眨眼缺陷反复复发的根源（每换一批人物就要重调阈值）。
+//
+// 官方 WE 的机制是**每骨不透明度包络**：MDLA 的 blend_curves（mdla>=3 每条动画都带）
+// 经 genericimage4.vert 的 g_BonesAlpha[] 乘进顶点 alpha，genericimage4.frag 再
+// `color.a *= v_VertexAlpha;`。闭眼时作者把「眼球 / 虹膜 / 睫毛」零件绑的骨曲线压到 0，
+// 零件自己就淡出了，不需要引擎猜。本引擎现已逐位实现该通道（顶点着色器 + 片元着色器 +
+// mdl-skin.js 的 computeBoneAlphas），启发式整体删除。
+//
+// 依据：参考引擎 Wallpaper_Compiler_ModelCompiler.cpp:1300-1305（parts 按作者 z 序逐段
+// 绘制）、:1329-1347（hasAlphaCurves → WE_CB_SKINNING_ALPHA）、PuppetRig.cpp:11-30 /
+// :298-305（alpha 乘算），官方 assets/shaders/genericimage4.vert:92/170-173。
 
 export function createMDLRenderer(gl) {
   // 按 GPU 上报的 uniform 预算编译；链接失败（驱动实际容量更小）时逐级减半重试。
@@ -576,8 +302,8 @@ export function createMDLRenderer(gl) {
     boneCount: gl.getUniformLocation(prog, 'u_boneCount'),
     color: gl.getUniformLocation(prog, 'u_color'),
     keepZ: gl.getUniformLocation(prog, 'u_keepZ'),
-    partScale: gl.getUniformLocation(prog, 'u_partScale'),
-    partPivot: gl.getUniformLocation(prog, 'u_partPivot'),
+    boneAlpha: gl.getUniformLocation(prog, 'u_boneAlpha'),
+    alphaOn: gl.getUniformLocation(prog, 'u_alphaOn'),
     normalMat: gl.getUniformLocation(prog, 'u_normalMat'),
     lightDir: gl.getUniformLocation(prog, 'u_lightDir'),
     lightBase: gl.getUniformLocation(prog, 'u_lightBase'),
@@ -591,12 +317,82 @@ export function createMDLRenderer(gl) {
     fogDistColor: gl.getUniformLocation(prog, 'u_fogDistColor'),
     fogHeight: gl.getUniformLocation(prog, 'u_fogHeight'),
     fogHeightColor: gl.getUniformLocation(prog, 'u_fogHeightColor'),
+    // [we-scene patch 2026-10-12] 掩码通道（见 MDL_FRAG 头注与 draw 里的逐零件分支）
+    maskTex: gl.getUniformLocation(prog, 'u_maskTex'),
+    maskOn: gl.getUniformLocation(prog, 'u_maskOn'),
+    maskWrite: gl.getUniformLocation(prog, 'u_maskWrite'),
+    viewport: gl.getUniformLocation(prog, 'u_viewport'),
   }
   const IDENTITY3 = new Float32Array([1, 0, 0, 0, 1, 0, 0, 0, 1])
   const ZERO3 = new Float32Array(3)
   const ZERO4 = new Float32Array(4)
   const identitySkin = new Float32Array(MAX_BONES * 16)
   for (let i = 0; i < MAX_BONES; i++) identitySkin.set(IDENTITY, i * 16)
+
+  // [we-scene patch 2026-10-12] **掩码缓冲**（Puppet Warp Clipping Mask 的屏幕空间载体）。
+  // 与当前 viewport 同尺寸：写入趟与读取趟用同一个 MVP 与同一个 viewport，于是
+  // `gl_FragCoord.xy / u_viewport` 就是缓冲 uv，不需要任何额外的屏幕包围盒推演。
+  // 只在真有掩码块的 puppet 上创建（24 个 puppet / 60 个块，见 /tmp/we/maskscan.json）。
+  let maskTarget = null
+  // 没有掩码的模型也要给 u_maskTex 绑一张完整纹理（采样器不能空绑）。**惰性创建**：
+  // createMDLRenderer 会被 verify-mdl-depth 的**最小 GL mock** 直接调用并且真的调
+  // `draw()`（`scripts/verify-mdl-depth.mjs:41 makeMockGL` 没有 createTexture），
+  // 构造期碰 GL 对象会把那条源码级 verifier 打红。mock 下返回 null ⇒ 掩码通道停用。
+  let whiteTex = null
+  // ★**在 draw() 里新建纹理必须把「当前活动纹理单元」的绑定还回去**：`gl.bindTexture`
+  // 绑的是**活动单元**，而这里创建资源时活动单元是 TEXTURE0（draw() 的默认态把它设回
+  // 0）。若把新纹理留在 TEXTURE0，它就会被程序当作 `u_tex` 采样 —— 掩码缓冲那张纹理
+  // 一旦同时是**当前 FBO 的颜色附件**，就构成纹理反馈环（feedback loop），于是掩码写入
+  // 趟的每一次 `drawElements` 都只回报 `GL_INVALID_OPERATION (1282)` 且**一个片元都不写**：
+  // 掩码缓冲全零 ⇒ 掩码通道静默失效（2026-10-12 用逐步 getError + readPixels 才挖到）。
+  const withTextureUnit = (unit, fn) => {
+    const prevActive = gl.getParameter(gl.ACTIVE_TEXTURE)
+    gl.activeTexture(gl.TEXTURE0 + unit)
+    const prevBind = gl.getParameter(gl.TEXTURE_BINDING_2D)
+    const out = fn()
+    gl.bindTexture(gl.TEXTURE_2D, prevBind)
+    if (prevActive !== gl.TEXTURE0 + unit) gl.activeTexture(prevActive)
+    return out
+  }
+  function ensureWhiteTex() {
+    if (whiteTex) return whiteTex
+    if (typeof gl.createTexture !== 'function') return null
+    withTextureUnit(1, () => {
+      const t = gl.createTexture()
+      gl.bindTexture(gl.TEXTURE_2D, t)
+      gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, 1, 1, 0, gl.RGBA, gl.UNSIGNED_BYTE, new Uint8Array([255, 255, 255, 255]))
+      gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.NEAREST)
+      gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.NEAREST)
+      gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE)
+      gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE)
+      whiteTex = t
+    })
+    return whiteTex
+  }
+  function ensureMaskTarget(w, h) {
+    if (maskTarget && maskTarget.w === w && maskTarget.h === h) return maskTarget
+    if (maskTarget) {
+      gl.deleteFramebuffer(maskTarget.fbo)
+      gl.deleteTexture(maskTarget.tex)
+    }
+    // 同上：整段在 TEXTURE1 上做，结束时把 TEXTURE1 的原绑定还回去（TEXTURE0 根本不动）。
+    const tex = withTextureUnit(1, () => {
+      const t = gl.createTexture()
+      gl.bindTexture(gl.TEXTURE_2D, t)
+      gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, w, h, 0, gl.RGBA, gl.UNSIGNED_BYTE, null)
+      gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR)
+      gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.LINEAR)
+      gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE)
+      gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE)
+      return t
+    })
+    const fbo = gl.createFramebuffer()
+    gl.bindFramebuffer(gl.FRAMEBUFFER, fbo)
+    gl.framebufferTexture2D(gl.FRAMEBUFFER, gl.COLOR_ATTACHMENT0, gl.TEXTURE_2D, tex, 0)
+    gl.bindFramebuffer(gl.FRAMEBUFFER, null)
+    maskTarget = { fbo, tex, w, h }
+    return maskTarget
+  }
 
   // 每个网格一套 VAO/VBO（顶点数据静态，蒙皮在 GPU 完成）。
   // [we-scene patch 2026-09-28] 键从 mdl 换成**子网格记录**：一个 MDL 可以有多个
@@ -754,6 +550,12 @@ export function createMDLRenderer(gl) {
       indices: mdl.indices,
       indexCount: mdl.indexCount,
       indexType: mdl.indexType,
+      // [we-scene patch 2026-10-12] **零件表也要透传**：单网格模型走这条伪网格，而掩码
+      // 通道（Puppet Warp Clipping Mask）必须逐零件绘制才能实现「a 件只在 b 件画到的
+      // 地方可见」。mdl.parts 是 parseMDL 的部件表（锚扫），meshes[0].parts 来自
+      // parseMeshes —— 两者都是**文件顺序**（实测 3629379075：id 12,10,11,9,1,…），
+      // 与掩码块里 a/b 的「parts[] 下标」同一套编号。
+      parts: mdl.parts || singleSub?.parts || null,
     }
     legacyCache.set(mdl, m)
     return m
@@ -841,13 +643,6 @@ export function createMDLRenderer(gl) {
       gl.uniform1f(uni.keepZ, opts.keepZ ? 1 : 0)
       const col = opts.color || [1, 1, 1, 1]
       gl.uniform4f(uni.color, col[0], col[1], col[2], col[3])
-      // 每零件缩放先复位成恒等——**必须每帧设**，不能只在下面的白名单分支里设：
-      // GL 的 uniform 默认值是 (0,0)，而顶点着色器里 `local.xy = u_partPivot + (local.xy
-      // − u_partPivot) * u_partScale` 在 (0,0) 下会把整张网格乘成 0 → 所有非白名单的
-      // puppet 全部塌到原点（实测 3798926489/3791967416/3737267090/3707219547 等整批
-      // 人物消失只剩零碎头发片）。恒等值下这一行是逐位恒等（×1 再加 0）。
-      gl.uniform2f(uni.partScale, 1, 1)
-      gl.uniform2f(uni.partPivot, 0, 0)
       // 蒙皮与混合对**整个模型**只算一次（骨架只有一套），逐子网格只换 VAO/贴图/索引。
       const skin = computeSkinMatrices(mdl, opts.time || 0, opts.animLayers, opts.boneOverrides)
       const count = Math.min(mdl.bones.length, MAX_BONES)
@@ -857,6 +652,43 @@ export function createMDLRenderer(gl) {
       } else {
         gl.uniformMatrix4fv(uni.skin, false, identitySkin)
         gl.uniform1i(uni.boneCount, 0)
+      }
+      // [we-scene patch 2026-10-12] 每骨不透明度包络（官方眨眼机制，见顶点着色器头注）。
+      // 只有包里真的带 blend_curves 且曲线降到过 1 以下的模型才开这条通道；关着时
+      // 顶点 alpha 恒 1.0、片元 `vec4(mul, v_alpha)` 逐位等于改动前的 `vec4(mul, 1.0)`。
+      // 与官方一致：官方也是 `puppet->hasAlphaCurves()` 为真才给材质开 SKINNING_ALPHA combo。
+      const ba = count > 0 ? computeBoneAlphas(mdl, opts.time || 0, opts.animLayers) : null
+      if (ba) {
+        gl.uniform1fv(uni.boneAlpha, ba.subarray(0, count))
+        gl.uniform1f(uni.alphaOn, 1)
+      } else {
+        gl.uniform1f(uni.alphaOn, 0)
+      }
+      // [we-scene patch 2026-10-12] 掩码通道的默认态：不裁剪、不写掩码、采样兜底白图。
+      // 逐网格的掩码分支（见文件末的零件循环）会临时改这三项并复位。
+      gl.uniform1f(uni.maskOn, 0)
+      gl.uniform1f(uni.maskWrite, 0)
+      const wt = ensureWhiteTex()
+      if (wt) {
+        gl.activeTexture(gl.TEXTURE1)
+        gl.bindTexture(gl.TEXTURE_2D, wt)
+      }
+      gl.uniform1i(uni.maskTex, 1)
+      const vpNow = gl.getParameter(gl.VIEWPORT) || [0, 0, gl.drawingBufferWidth, gl.drawingBufferHeight]
+      gl.uniform2f(uni.viewport, vpNow[2] || 1, vpNow[3] || 1)
+      gl.activeTexture(gl.TEXTURE0)
+      const applyBlend = () => {
+        if (opts.blending === 'additive') {
+          gl.enable(gl.BLEND)
+          gl.blendEquation(gl.FUNC_ADD)
+          gl.blendFuncSeparate(gl.SRC_ALPHA, gl.ONE, gl.ONE, gl.ONE)
+        } else if (opts.blending === 'normal') {
+          gl.disable(gl.BLEND)
+        } else {
+          gl.enable(gl.BLEND)
+          gl.blendEquation(gl.FUNC_ADD)
+          gl.blendFuncSeparate(gl.SRC_ALPHA, gl.ONE_MINUS_SRC_ALPHA, gl.ONE, gl.ONE_MINUS_SRC_ALPHA)
+        }
       }
       if (opts.blending === 'additive') {
         gl.enable(gl.BLEND)
@@ -897,8 +729,8 @@ export function createMDLRenderer(gl) {
       }
       const identity = opts.overrideTex || (texture && texture.glTex ? texture.glTex : texture) || null
       // 多子网格：mdl.meshes 是 parseMeshes 的产物（1 个网格时与上面这份伪网格等价）。
-      // 零件表（parts）只挂在第一个子网格上：那是 2D puppet 的「收拢零件」规则用的
-      // 元数据，而那批模型都是单网格；多网格的 3D 模型不做零件剔除（画满索引区）。
+      // 零件表（mdl.parts）仍由 parseMDL 产出，但绘制侧不再使用 —— 它现在只服务
+      // 编辑器（puppet warp / mdl-edit）与 verify-mdl-write 的读回断言。
       const list = meshListOf(mdl)
       const legacyMesh = list ? null : legacyMeshOf(mdl)
       const n = list ? list.length : 1
@@ -970,25 +802,93 @@ export function createMDLRenderer(gl) {
         const src = opts.overrideTex || (per && per.glTex ? per.glTex : per) || identity
         gl.bindTexture(gl.TEXTURE_2D, src)
         const idxType = mesh.indexType === 'u32' ? gl.UNSIGNED_INT : gl.UNSIGNED_SHORT
-        const parts = gi === 0 ? mdl.parts : null
-        const squash = parts && opts.syncCoveredParts ? collapsedPartSquash(mdl, skin, opts.animLayers) : null
-        // 只有这一帧真要压扁才拆成按零件画。squash 为 null 时整网格一次画完，
-        // 和改门控之前的非白名单路径一样——不能因为「允许检测」就每帧拆 draw。
-        if (squash) {
-          const bytes = idxType === gl.UNSIGNED_INT ? 4 : 2
-          for (let i = 0; i < parts.length; i++) {
-            const k = squash ? squash[i * 3] : 1
-            if (k < 0.25) continue // 压到 1/4 以下视同收完：不画（回弹时同一条判据自动恢复）
-            const part = parts[i]
-            const pivotX = squash && k < 1 ? squash[i * 3 + 1] : (part.x0 + part.x1) / 2
-            const pivotY = squash && k < 1 ? squash[i * 3 + 2] : (part.y0 + part.y1) / 2
-            gl.uniform2f(uni.partScale, 1, k)
-            gl.uniform2f(uni.partPivot, pivotX, pivotY)
-            gl.drawElements(gl.TRIANGLES, part.size, idxType, part.start * bytes)
-          }
-        } else {
+        // [we-scene patch 2026-10-12] 零件级「收拢压扁 / 剔除」已删除（见本文件顶部那段
+        // 墓志注）：官方靠**每骨不透明度包络**让零件淡出，不靠引擎按包围盒猜。
+        //
+        // **掩码块（clipping mask）→ 逐零件绘制**：有掩码块的 puppet 不能再整网格一次
+        // drawElements，因为 a 件（被裁剪件，作者绑的虹膜/高光）只在 b 件（掩码件，
+        // 眼睑）画到的地方可见 —— 这正是「闭眼时虹膜消失」的官方做法。没有掩码块的
+        // 模型仍走单次 drawElements（与改动前逐位一致）。
+        const partsTable = mesh.parts && mesh.parts.length > 0 ? mesh.parts : null
+        const mblocks = partsTable && mdl.maskBlocks && mdl.maskBlocks.length > 0 ? mdl.maskBlocks : null
+        if (!mblocks) {
           gl.drawElements(gl.TRIANGLES, mesh.indexCount, idxType, 0)
+          continue
         }
+        const iw = mesh.indexType === 'u32' ? 4 : 2
+        // 掩码写入趟：把 b 件画进与 viewport 同尺寸的掩码缓冲（MAX 混合累积覆盖率）。
+        // 同一 (掩码材质 + b 表) 只在本次 draw 里建一次（3629379075 的 6 个块 → 2 张）。
+        const built = new Map()
+        const buildMask = (blk, bi) => {
+          const vp = gl.getParameter(gl.VIEWPORT) || [0, 0, gl.drawingBufferWidth, gl.drawingBufferHeight]
+          const w = Math.max(1, vp[2] | 0)
+          const h = Math.max(1, vp[3] | 0)
+          const tgt = ensureMaskTarget(w, h)
+          const prevFbo = gl.getParameter(gl.FRAMEBUFFER_BINDING)
+          const scissorOn = gl.isEnabled(gl.SCISSOR_TEST)
+          if (scissorOn) gl.disable(gl.SCISSOR_TEST)
+          // u_maskTex 在写入趟里是**掩码贴图**（官方 g_Texture1），在裁剪趟里换成
+          // 屏幕空间缓冲 —— 同一个 uniform，两次绑定。
+          // 掩码贴图与 meshTextures 同形（宿主存的是贴图包装对象，原始 GL 纹理在 `.glTex`，
+          // 见上面 `per.glTex` 的同一约定）——漏拆包会直接抛
+          // `bindTexture: parameter 2 is not of type WebGLTexture`。
+          const mm0 = opts.maskTextures && opts.maskTextures[bi]
+          const maskImg = (mm0 && mm0.glTex ? mm0.glTex : mm0) || ensureWhiteTex()
+          gl.bindFramebuffer(gl.FRAMEBUFFER, tgt.fbo)
+          gl.viewport(vp[0], vp[1], w, h)
+          gl.clearColor(0, 0, 0, 0)
+          gl.clear(gl.COLOR_BUFFER_BIT)
+          gl.enable(gl.BLEND)
+          gl.blendEquation(gl.MAX)
+          gl.blendFunc(gl.ONE, gl.ONE)
+          gl.uniform1f(uni.maskWrite, 1)
+          gl.activeTexture(gl.TEXTURE1)
+          gl.bindTexture(gl.TEXTURE_2D, maskImg)
+          for (const b of blk.partIdsB) {
+            const bp = partsTable[b]
+            if (!bp || !bp.size) continue
+            gl.drawElements(gl.TRIANGLES, bp.size, idxType, bp.start * iw)
+          }
+          gl.uniform1f(uni.maskWrite, 0)
+          gl.bindFramebuffer(gl.FRAMEBUFFER, prevFbo)
+          gl.viewport(vp[0], vp[1], w, h)
+          gl.blendEquation(gl.FUNC_ADD)
+          applyBlend()
+          if (scissorOn) gl.enable(gl.SCISSOR_TEST)
+          return tgt.tex
+        }
+        const blkOf = (pi) => {
+          for (let b = 0; b < mblocks.length; b++) if (mblocks[b].partIdsA.indexOf(pi) >= 0) return [mblocks[b], b]
+          return null
+        }
+        const drawPart = (pi) => {
+          const p = partsTable[pi]
+          if (!p || !p.size) return
+          const hit = blkOf(pi)
+          if (hit) {
+            const [blk, bi] = hit
+            const key = blk.matPath + '|' + blk.partIdsB.join(',')
+            let mt = built.get(key)
+            if (!mt) {
+              mt = buildMask(blk, bi)
+              built.set(key, mt)
+            }
+            gl.activeTexture(gl.TEXTURE1)
+            gl.bindTexture(gl.TEXTURE_2D, mt)
+            gl.uniform1f(uni.maskOn, 1)
+          } else {
+            gl.uniform1f(uni.maskOn, 0)
+          }
+          gl.drawElements(gl.TRIANGLES, p.size, idxType, p.start * iw)
+        }
+        // 被掩码裁剪的零件要**单独一趟、画在未被裁剪的几何之后**：官方引擎为掩盖零件生成独立的
+        // mask 子网格（`GenMaskSubmeshFromMdl`，见 `Wallpaper_Compiler_ModelCompiler.cpp:1313`），
+        // 被裁剪件的绘制与基础网格分开，能盖住（而不是被盖住）眼睑/睫毛。按文件顺序画时，
+        // 3629379075 的虹膜会被后面的睫毛件整条盖掉，官方 f54 却留着一条琥珀色残带 + 高光点。
+        for (let pi = 0; pi < partsTable.length; pi++) if (!blkOf(pi)) drawPart(pi)
+        for (let pi = 0; pi < partsTable.length; pi++) if (blkOf(pi)) drawPart(pi)
+        gl.uniform1f(uni.maskOn, 0)
+        gl.activeTexture(gl.TEXTURE0)
       }
       if (useDepth) {
         gl.depthMask(false)
@@ -999,4 +899,4 @@ export function createMDLRenderer(gl) {
   }
 }
 
-export { parseMDL, computeSkinMatrices, bindWorldOf, mat4MulOut, attachmentWorld, attachmentBind, attachmentEffectiveOffset, parentMeshToWorldDelta, applyAttachmentBindOrigins, followAttachments, skinnedMeshes }
+export { parseMDL, computeSkinMatrices, computeBoneAlphas, bindWorldOf, mat4MulOut, attachmentWorld, attachmentBind, attachmentEffectiveOffset, parentMeshToWorldDelta, applyAttachmentBindOrigins, followAttachments, skinnedMeshes }

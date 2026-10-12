@@ -44,6 +44,35 @@ function clipLocalTime(L, time) {
 // 逐槽分布（an24，全库所有关键帧）也自洽：k[3]/k[4] 有 99.9%/100% 为 0（2D 的 rx/ry），
 // k[6]/k[7]/k[8] 分别有 97.4%/97.5%/98.7% 恰为 1（缩放默认值），
 // 而 k[5] 取值域 [-8.338, 6.187] 远超 ±1，本就不可能是单位四元数分量。
+// 关键帧索引（官方 `InterpolationInfo` / genInterpolationInfo）：
+//   loop   按**区间数**（frameCount）环绕 —— 末帧与首帧重合，故能无缝首尾相接；
+//   mirror 正播到末帧再倒播回首帧，周期 2(n-1)；
+//   其余（single / 未声明）clamp 到 [0, n-1]。
+// [we-scene patch 2026-10-12] 抽成函数给**轨道 TRS** 与**每骨不透明度包络**共用：
+// 官方两条通道共用同一个 `layer.interp_info`（PuppetRig.cpp:271 取 track[i]、
+// :302 取 curve[i]，用的是同一个 info），所以曲线必须与轨道落在完全相同的帧上。
+function frameIndices(anim, time, n) {
+  const frame = time * anim.fps
+  if (n <= 1) return { f0: 0, f1: 0, t: 0 }
+  if (anim.mode === 'loop') {
+    const span = Math.max(1, n - 1)
+    const w = ((frame % span) + span) % span
+    const f0 = Math.floor(w)
+    return { f0, f1: (f0 + 1) % n, t: w - f0 }
+  }
+  if (anim.mode === 'mirror') {
+    const span = Math.max(1, n - 1)
+    const period = span * 2
+    let w = ((frame % period) + period) % period
+    if (w > span) w = period - w
+    const f0 = Math.floor(w)
+    return { f0, f1: Math.min(f0 + 1, n - 1), t: w - f0 }
+  }
+  const c = Math.min(Math.max(frame, 0), n - 1)
+  const f0 = Math.floor(c)
+  return { f0, f1: Math.min(f0 + 1, n - 1), t: c - f0 }
+}
+
 function sampleTrackTRS(track, anim, time, out9) {
   const n = track.frameCount
   if (n === 0) {
@@ -52,34 +81,7 @@ function sampleTrackTRS(track, anim, time, out9) {
     out9[6] = 1; out9[7] = 1; out9[8] = 1
     return out9
   }
-  const frame = time * anim.fps
-  let f0
-  let f1
-  let t
-  if (anim.mode === 'loop') {
-    // 末帧与首帧重合（frameCount+1 个关键帧），故按 frameCount 环绕可无缝首尾相接
-    const span = Math.max(1, n - 1)
-    const w = ((frame % span) + span) % span
-    f0 = Math.floor(w)
-    f1 = (f0 + 1) % n
-    t = w - f0
-  } else if (anim.mode === 'mirror') {
-    // [we-scene patch] mirror：正播到末帧再倒播回首帧，周期 2(n-1)。
-    // 此前没有这个分支，会掉进下面的 clamp 把动画**冻结在末帧**
-    // （3148125112 五个 puppet 全是 mirror，t>5s 后整体定格在最大幅度姿势）。
-    const span = Math.max(1, n - 1)
-    const period = span * 2
-    let w = ((frame % period) + period) % period
-    if (w > span) w = period - w
-    f0 = Math.floor(w)
-    f1 = Math.min(f0 + 1, n - 1)
-    t = w - f0
-  } else {
-    const c = Math.min(Math.max(frame, 0), n - 1)
-    f0 = Math.floor(c)
-    f1 = Math.min(f0 + 1, n - 1)
-    t = c - f0
-  }
+  const { f0, f1, t } = frameIndices(anim, time, n)
   const k = track.keyframes
   const a = f0 * 9
   const b = f1 * 9
@@ -157,6 +159,98 @@ function staticPoseTRS(mdl, i, out9) {
 // 计算 time 处的蒙皮矩阵数组（World(anim) · invBindWorld），写入 mdl._skinCache
 // [we-scene patch] boneOverrides：脚本层的骨骼平移覆写（`Map<boneIndex, [x,y,z]>`，
 // **骨骼局部空间**，由宿主从世界像素换算而来，见 render/text.js 的 makeBoneApi）。
+// [we-scene patch 2026-10-12] 层表解析。**computeSkinMatrices（姿势）与
+// computeBoneAlphas（不透明度）必须用同一份层表** —— 官方两条通道读的是同一个
+// `puppet_layer.m_layers`（PuppetRig.cpp:243 算 blend、:298-304 算 alpha），
+// 不同步会出现「姿势闭眼了但不透明度没跟上」这类错帧。
+//   visible=false/0 → 不参与（官方 IAnimationLayer.visible）
+//   playing=false   → 脚本 stop() 掉的层不参与蒙皮（3396722575 错帧机制）
+function resolveLayers(mdl, animLayers) {
+  const layers = []
+  if (!Array.isArray(animLayers) || animLayers.length === 0) return layers
+  for (const l of animLayers) {
+    if (l.visible === false || l.visible === 0) continue
+    if (l.playing === false) continue
+    const a = mdl.animations.find((x) => x.id === l.animation)
+    if (a) {
+      layers.push({
+        anim: a,
+        additive: !!l.additive,
+        blend: typeof l.blend === 'number' ? l.blend : 1,
+        rate: typeof l.rate === 'number' ? l.rate : 1,
+        clip: l,
+      })
+    }
+  }
+  return layers
+}
+
+/**
+ * [we-scene patch 2026-10-12] 每骨不透明度（官方 WE 的「眨眼 / 零件淡出」机制）。
+ *
+ * 官方 genericimage4.vert（SKINNING_ALPHA combo）把每骨不透明度按顶点权重加权求和后乘进
+ * 顶点 alpha：`v_VertexAlpha *= saturate(g_BonesAlpha[a_BlendIndices.x]*a_BlendWeights.x + ...)`，
+ * genericimage4.frag 再 `color.a *= v_VertexAlpha;`。数值来自 MDLA 的 blend_curves
+ * （mdla>=3 每条动画都带、每骨一条、样本数 = frameCount+1），语义见参考引擎
+ * Wallpaper_Compiler_PuppetRig.cpp:11-30 与 :298-305：
+ *
+ *   alpha = 1
+ *   for (layer : layers)                      // 只看 visible 且有动画的层
+ *     alpha *= clamp(1 + clamp(layer.blend,0,1) * (curve(bone) - 1), 0, 1)
+ *   final[bone] = clamp(alpha, 0, 1)
+ *
+ * 曲线采样与轨道共用 frameIndices（官方两条通道共用同一个 interp_info：
+ * PuppetRig.cpp:271 取 track[i]、:302 取 curve[i]），所以曲线必然落在与姿势相同的帧上。
+ *
+ * 返回 null = 「这一帧不用走 alpha 通道」（没有曲线 / 曲线恒为 1 / 没有可见层），
+ * 调用方据此把 u_alphaOn 置 0，那条路径与改动前逐位一致（全库 938 个 puppet 里
+ * 457 个带曲线，占 49%）。
+ *
+ * 注意：官方 MDLA 尾部还有一类 scalar_curves，它喂的是**姿势混合权重**
+ * （LayerBoneBlend = max(0, blend × scalar)），与 alpha 无关。本机全库只有 2 条动画带它
+ * （3577990983 sl 的 «h» / «眼»），取值域 0..316 远超官方假定的 0..1，按官方公式应用
+ * 会得到 316× 权重 ⇒ 只解析、不在运行期使用。
+ */
+export function computeBoneAlphas(mdl, time, animLayers) {
+  const anims = mdl.animations
+  if (!mdl.hasAlphaCurves || !anims || !anims.length) return null
+  const count = mdl.bones.length
+  if (count === 0) return null
+  const layers = resolveLayers(mdl, animLayers)
+  if (layers.length === 0) {
+    // 层表非空但全被 visible/playing 关掉 → 官方也不乘（m_layers 里那条不参与）。
+    if (Array.isArray(animLayers) && animLayers.length > 0) return null
+    // 场景没给 animationlayers 时的兼容路径：姿势用 animations[0]，不透明度也用它，
+    // 否则「有动画的模型没有层表」会出现姿势在眨眼、眼白不淡出的错帧。
+    const a = anims[0]
+    if (!a) return null
+    layers.push({ anim: a, additive: false, blend: 1, rate: 1 })
+  }
+  const out = mdl._boneAlpha && mdl._boneAlpha.length === count
+    ? mdl._boneAlpha
+    : (mdl._boneAlpha = new Float32Array(count))
+  out.fill(1)
+  let any = false
+  for (const L of layers) {
+    const curves = L.anim.blendCurves
+    if (!curves) continue
+    const w = Math.min(Math.max(typeof L.blend === 'number' ? L.blend : 1, 0), 1)
+    const t = clipLocalTime(L, time)
+    for (let i = 0; i < count; i++) {
+      const c = curves[i]
+      if (!c || c.length < 2) continue
+      const fr = frameIndices(L.anim, t, c.length)
+      const v = c[fr.f0] * (1 - fr.t) + c[fr.f1] * fr.t
+      let a = 1 + w * (v - 1)
+      if (a < 0) a = 0
+      else if (a > 1) a = 1
+      out[i] *= a
+      if (out[i] < 1) any = true
+    }
+  }
+  return any ? out : null
+}
+
 // WE 的 thisLayer.setBoneTransform() 语义按全库 4 处调用点实测为**绝对覆盖**而非累加
 // （脚本每帧从 dragStart 重算绝对位置再写入；累加会让骨骼瞬间飞走）。
 // 覆写写在 composeTRS **之前**，这样子骨会经下面的父链传播自动跟随。
@@ -197,17 +291,7 @@ export function computeSkinMatrices(mdl, time, animLayers, boneOverrides) {
   // 只有调用方没给层信息（undefined / 空数组）时才退回第一条，兼容没写
   // animationlayers 的旧场景。
   const hadExplicitLayers = Array.isArray(animLayers) && animLayers.length > 0
-  const layers = []
-  if (hadExplicitLayers) {
-    for (const l of animLayers) {
-      if (l.visible === false || l.visible === 0) continue
-      // [we-scene patch] 脚本 play()/stop() 运行态：stop 后该层不参与蒙皮
-      //（3396722575 错帧机制：init 停掉错位层、帧事件到达再 play）。
-      if (l.playing === false) continue
-      const a = mdl.animations.find((x) => x.id === l.animation)
-      if (a) layers.push({ anim: a, additive: !!l.additive, blend: typeof l.blend === 'number' ? l.blend : 1, rate: typeof l.rate === 'number' ? l.rate : 1, clip: l })
-    }
-  }
+  const layers = resolveLayers(mdl, animLayers)
   // [we-scene patch] 标记「零动画且无覆写」：draw 仍按 identitySkin 走（绑定姿势蒙皮
   // 恒等于单位变换），但**不能再提前 return** —— 早退会让 _world 停在未填充的零矩阵，
   // attachmentWorld 读到附着点 (0,0)，followAttachments 算出 delta = 0 − 绑定偏移，

@@ -574,6 +574,9 @@ export function parseMDL(buf) {
     staticPosePermutation: staticPermutation,
     staticPoseAt: staticPose ? staticPose.at : -1,
     animations,
+    // [we-scene patch 2026-10-12] 任一动画带**每骨不透明度包络**（官方 hasAlphaCurves，
+    // 决定渲染侧要不要开 SKINNING_ALPHA 变体）。全库 938 个 puppet 里 456 个为 true。
+    hasAlphaCurves: animations.some((x) => x.hasAlpha),
     // 动画平移极值（见 animDisplacementBound）：供渲染器放宽视锥裁剪余量
     animBound: animDisplacementBound(animations, bones),
     invBindWorld,
@@ -582,6 +585,11 @@ export function parseMDL(buf) {
     restCorrection: restCorrection.length > 0 ? restCorrection : null,
     // MDLV 部件表 + 每零件元数据（主导骨/静止包围盒/顶点集）；无该表为 null
     parts: partsMeta,
+    // [we-scene patch 2026-10-12] MDL 掩码块（Puppet Warp Clipping Mask）：`a` 件被
+    // `b` 件（掩码件）裁剪，`matPath` 是掩码贴图材质。布局见 parseMeshes 的掩码
+    // 遍历（与 Mirage ModelCompiler.cppm:62-70 的 MaskBlock 同序）。单网格模型取
+    // mesh0 的；无掩码为 null。
+    maskBlocks: meshes && meshes.length > 0 ? meshes[0].maskBlocks || null : null,
     bounds: { minX, maxX, minY, maxY },
   }
 }
@@ -726,6 +734,7 @@ function parseMeshes(buf, dv, ver, mdlFlag, skinCount, meshCount, firstMatOff) {
     }
     p += idxBytes
     let parts = null
+    let maskBlocks = null
     if (ver >= 21) {
       if (p + 1 > dv.byteLength) return null
       const unkA = dv.getUint8(p)
@@ -764,19 +773,37 @@ function parseMeshes(buf, dv, ver, mdlFlag, skinCount, meshCount, firstMatOff) {
         if (p + 4 > dv.byteLength) return null
         const maskCount = dv.getUint32(p, true)
         p += 4
+        // [we-scene patch 2026-10-12] 掩码块不再「读完就丢」：官方把这里读成
+        // `MaskBlock { leading_a, mat_json, part_ids_a, part_ids_b }`（Mirage
+        // Wallpaper/Compiler/ModelCompiler.cppm:62-70 的 ParseMasks 同序）。
+        // a/b 里存的是 **src.parts[] 的下标**（不是 part.id：3629379075 的
+        // b=[0,1,2,3] 含不存在的 id 0，而 0..3 正好是部件表前四条）。渲染语义见
+        // mdl.js「掩码件裁剪」：a 件只在 b 件（掩码件）画出的地方可见。
+        const blocks = []
         for (let k = 0; k < maskCount; k++) {
           if (p + 8 > dv.byteLength) return null
+          const leadingA = dv.getUint32(p, true)
           p += 8 // leading_a + zero_a
           const c = readCStr(dv, p)
+          const matPath = c.value
           p = c.next + 4 // 材质 json + zero_pad
           if (p + 4 > dv.byteLength) return null
           const ac = dv.getUint32(p, true)
-          p += 4 + ac * 4
+          p += 4
+          if (p + ac * 4 > dv.byteLength) return null
+          const partIdsA = []
+          for (let i = 0; i < ac; i++) partIdsA.push(dv.getUint32(p + i * 4, true))
+          p += ac * 4
           if (p + 4 > dv.byteLength) return null
           const bc = dv.getUint32(p, true)
-          p += 4 + bc * 4
-          if (p > dv.byteLength) return null
+          p += 4
+          if (p + bc * 4 > dv.byteLength) return null
+          const partIdsB = []
+          for (let i = 0; i < bc; i++) partIdsB.push(dv.getUint32(p + i * 4, true))
+          p += bc * 4
+          blocks.push({ leadingA, matPath, partIdsA, partIdsB })
         }
+        maskBlocks = blocks.length > 0 ? blocks : null
       }
     }
     if (p > dv.byteLength) return null
@@ -797,6 +824,7 @@ function parseMeshes(buf, dv, ver, mdlFlag, skinCount, meshCount, firstMatOff) {
       indexCount,
       indexType: useU32 ? 'u32' : 'u16',
       parts,
+      maskBlocks,
     })
   }
   return meshes
@@ -1180,8 +1208,177 @@ function parseAnimEvents(dv, from, limit) {
   return { events, next: p }
 }
 
+// [we-scene patch 2026-10-12] 有尾巴走位时的事件表**精确**解析。官方
+// `event_count u32` 之后是 `[u32 time_value][JSON cstr]` × count
+// （参考引擎 ModelCompiler.cpp:762-767），条数已知就不必再用「64 字节窗口找 '{' + 链式
+// 伴随填充」的启发式 —— 那个启发式在轨道浮点里撞上 0x7B 会把落点留在假记录上
+// （3306942838 тело_puppet 因此丢过 4 条动画）。返回 null 时调用方退回启发式路径。
+function parseAnimEventsExact(dv, o, count, limit) {
+  const events = []
+  for (let i = 0; i < count; i++) {
+    if (o + 4 > limit) return null
+    o += 4 // time_value
+    const r = readCStr(dv, o)
+    if (!r || r.next <= o || r.next > limit) return null
+    let ev = null
+    try {
+      ev = JSON.parse(r.value)
+    } catch {
+      ev = null
+    }
+    if (!ev || typeof ev !== 'object' || !Number.isFinite(Number(ev.frame)) || typeof ev.name !== 'string') return null
+    events.push({ frame: Number(ev.frame), name: ev.name })
+    o = r.next
+  }
+  return { events, next: o }
+}
+
+// [we-scene patch 2026-10-12] **每骨不透明度包络**（官方 `g_BonesAlpha` 的数据源）。
+//
+// 官方 .mdl 的每条动画在骨骼轨道之后还有一层 AnimBoneCurves 块（参考引擎
+// ModelCompiler.cpp:562-586 的逐字节实现）。官方 shader 就是靠它把「眨眼时该消失的
+// 虹膜/睫毛」淡出：`assets/shaders/genericimage4.vert:92` `uniform float
+// g_BonesAlpha[BONECOUNT];` → `:170-173` `v_VertexAlpha *= saturate(g_BonesAlpha[
+// a_BlendIndices.x]*a_BlendWeights.x + …)` → `genericimage4.frag:194` `color.a *=
+// v_VertexAlpha;`。曲线是 0..1 的不透明度，样本数 = 动画区间数 + 1（与轨道同长），
+// **与骨骼 TRS 无关**（作者给一根骨画包络，绑在该骨上的零件就整体淡出）。
+//
+// 格式（hexpat AnimBoneCurves）：`u8 has_curves`；=1 时逐骨
+// `u32 zero(恒 0) + u32 byte_size + f32[byte_size/4]`。
+//
+// 本仓此前完全没有这条通道（`grep -rn "g_BonesAlpha\|blend_curves"` 零命中），于是历次
+// 用 mdl.js 的 collapsedPartSquash 启发式伪造同一效果 —— 那正是眨眼缺陷反复出现的原因。
+function parseAnimBoneCurves(dv, o, boneCount, limit) {
+  if (o + 1 > limit) return null
+  const has = dv.getUint8(o)
+  o += 1
+  if (!has) return { curves: null, next: o }
+  if (!(boneCount > 0 && boneCount <= 4096)) return null
+  const curves = []
+  for (let b = 0; b < boneCount; b++) {
+    if (o + 8 > limit) return null
+    const zero = dv.getUint32(o, true)
+    const byteSize = dv.getUint32(o + 4, true)
+    o += 8
+    if (zero !== 0 || byteSize % 4 !== 0 || o + byteSize > limit) return null
+    const n = byteSize / 4
+    const v = new Float32Array(n)
+    for (let i = 0; i < n; i++) v[i] = dv.getFloat32(o + i * 4, true)
+    o += byteSize
+    curves.push(v)
+  }
+  return { curves, next: o }
+}
+
+// mdla>=3 的动画尾部：trans 块 → 每骨不透明度包络 → （v4 事件 / aabb / scalar 曲线）。
+// 逐字段照参考引擎 ModelCompiler.cpp 的 ParseAnimation 复刻（`:646-757`）。
+// **任何一处不自洽就返回 null**，调用方退回原来的「锚扫下一条动画头」路径 —— 退路与
+// 改动前逐位一致，所以本函数只可能**增加**信息，不会让已有语料变差。
+function parseAnimTail(dv, o, ver, length, boneCount, limit) {
+  const at = (p) => (p + 4 <= limit ? dv.getUint32(p, true) : null)
+  // 官方 is_anim_trans_main_size：byte_size == (length+1)*36（9 float/帧）或 (length+1)*4
+  const isMain = (bs) => bs === (length + 1) * 36 || bs === (length + 1) * 4
+  const tf = at(o)
+  if (tf === null) return null
+  o += 4
+  if (tf === 1) {
+    // [参考引擎 ModelCompiler.cpp:653-680] 字段序 = `extra_size` → extra（仅当 >0）→
+    // `extra_zero`（**仅当 extra>0**）→ `main_size` → main → `trail_zero`（仅当 extra>0）。
+    // extra==0 时**没有** extra_zero 字段：多读这 4 字节会把 main_size 读错位
+    // （3292361861 人物部件的主轨 484 字节整块被跳过，6 条动画只剩 1 条）。
+    const extra = at(o)
+    if (extra === null || extra % 4 !== 0) return null
+    o += 4
+    if (extra > 0) {
+      o += extra
+      if (at(o) === null) return null
+      o += 4 // extra_zero（官方只告警不判错）
+    }
+    const main = at(o)
+    if (main === null || main % 4 !== 0) return null
+    o += 4 + main
+    if (extra > 0) {
+      if (at(o) === null) return null
+      o += 4 // trail_zero
+    }
+  } else if (tf === 0) {
+    const bs = at(o)
+    if (bs === null) return null
+    if (bs !== 0 && isMain(bs)) o += 4 + bs
+    // 零分隔的 tail tracks（`[u32 0][u32 byte_size][data]`），最多 64 条
+    for (let g = 0; g < 64; g++) {
+      const z = at(o)
+      const bs2 = at(o + 4)
+      if (z !== 0 || bs2 === null || !isMain(bs2)) break
+      o += 8 + bs2
+    }
+  } else {
+    return null
+  }
+  if (o > limit) return null
+  const blend = parseAnimBoneCurves(dv, o, boneCount, limit)
+  if (!blend) return null
+  o = blend.next
+  let scalar = null
+  if (ver >= 4) {
+    if (o + 1 > limit) return null
+    const has4 = dv.getUint8(o)
+    if (has4 > 1) return null
+    o += 1
+    if (has4 === 1) {
+      const cnt = at(o)
+      if (cnt === null || cnt > 4096) return null
+      o += 4
+      for (let e = 0; e < cnt; e++) {
+        if (o + 8 > limit) return null
+        const curveCount = dv.getUint16(o + 4, true)
+        o += 8 // time f32 + curveCount u16 + flags u16
+        if (curveCount === 0 || curveCount > 4096) return null
+        for (let c = 0; c < curveCount; c++) {
+          if (c > 0) o += 2 // 首条曲线 Id 恒 0 不占字节，其余各 2 字节
+          const bs = at(o)
+          if (bs === null || bs % 4 !== 0) return null
+          o += 4 + bs
+        }
+      }
+    }
+  }
+  if (ver >= 5) {
+    if (o + 24 > limit) return null
+    o += 24 // aabb_min 3f + aabb_max 3f
+  }
+  if (ver === 6) {
+    // 官方 next_is_anim_bone_curves：peek u8；0 → 有（ParseAnimBoneCurves 只消费这 1 字节）；
+    // 否则要求 `u32@+1 == 0 && u32@+5 % 4 == 0`。不满足就**一个字节都不消费**。
+    if (o + 1 > limit) return null
+    const has = dv.getUint8(o)
+    const ok =
+      has === 0 || (o + 9 <= limit && at(o + 1) === 0 && at(o + 5) !== null && at(o + 5) % 4 === 0)
+    if (ok) {
+      const sc = parseAnimBoneCurves(dv, o, boneCount, limit)
+      if (!sc) return null
+      o = sc.next
+      scalar = sc.curves
+    }
+  }
+  // 事件条数（u32）—— **必须消费掉**：参考引擎 `:646-757` 在 scalar 曲线之后读它，
+  // 不读就会少走 4 字节，落点落在「下一条动画头 − 4」上，锚扫随即跳过一整条真动画
+  // （3306942838 тело_puppet：13 条 → 9 条）。
+  const evCount = at(o)
+  if (evCount === null || evCount > 65536) return null
+  o += 4
+  return { next: o, eventCount: evCount, blendCurves: blend.curves, scalarCurves: scalar }
+}
+
 function parseAnimations(buf, dv, boneCount, a) {
   if (a < 0) return []
+  // 段签名是 8 字节（"MDLA0006"），末 4 位是 mdla 版本 —— 曲线块与 trans 块的有无都
+  // 按版本分流（mdla>=3 才有 trans + blend_curves，mdla==6 才有 scalar_curves）。
+  const d = (i) => {
+    const c = dv.getUint8(a + i) - 48
+    return c >= 0 && c <= 9 ? c : -1
+  }
+  const tagVer = d(4) < 0 || d(5) < 0 || d(6) < 0 || d(7) < 0 ? 0 : d(4) * 1000 + d(5) * 100 + d(6) * 10 + d(7)
   let o = a + 9
   const endPos = dv.getUint32(o, true)
   o += 4
@@ -1222,10 +1419,56 @@ function parseAnimations(buf, dv, boneCount, a) {
       o += trackBytes
       tracks.push({ frameCount: n, keyframes: kf })
     }
-    // [we-scene patch] 尾部事件表 + 锚扫下一条动画头（替代固定 o+=35，见文件头注释）
+    // [we-scene patch 2026-10-12] mdla>=3：轨道之后是 trans 块 + 每骨不透明度包络
+    // （+ v4 事件 / aabb / scalar 曲线）。走通就以此定位事件表起点；走不通保持 o 不变，
+    // 退回下面的锚扫路径（与改动前逐位一致）。
     const limit = endPos > 0 && endPos <= dv.byteLength ? endPos : dv.byteLength
-    const ev = parseAnimEvents(dv, o, limit)
+    let blendCurves = null
+    let scalarCurves = null
+    let tailEvents = -1
+    if (tagVer >= 3) {
+      const tail = parseAnimTail(dv, o, tagVer, frameCount, trackCount, limit)
+      if (tail) {
+        o = tail.next
+        blendCurves = tail.blendCurves
+        scalarCurves = tail.scalarCurves
+        tailEvents = tail.eventCount
+      }
+    }
+    // 下一条动画头 / 事件表。
+    // [we-scene patch 2026-10-12] 尾部走位自洽且 `event_count == 0` 时，**轨道尾 + 35B 的
+    // 那个偏移就是下一条动画头**，直接采信、不做锚扫。锚扫（findNextAnimHeader）在
+    // 30 万字节级的大 puppet 上会被轨道里的浮点巧合命中/漏命中：3306942838 的
+    // тело_puppet（9.6MB / 13 条动画）里，从轨道尾 +31 起扫时窗口内一个 0x7B 让
+    // parseAnimEvents 提前收尾，锚扫于是**跳过**了下一条真动画（id=746 «руки»），
+    // 13 条只剩 9 条。有了精确偏移就不需要这条启发式。
+    let events = []
+    let next = -1
+    if (tailEvents === 0) {
+      // 无事件：尾部之后**就是**下一条动画头
+      next = o
+    } else if (tailEvents > 0) {
+      // 条数已知：精确逐条读，再锚扫下一条动画头（事件表后有可选填充）
+      const ex = parseAnimEventsExact(dv, o, tailEvents, limit)
+      if (ex) {
+        events = ex.events
+        next = findNextAnimHeader(dv, ex.next, limit)
+      } else {
+        const ev = parseAnimEvents(dv, o, limit)
+        events = ev.events
+        next = findNextAnimHeader(dv, ev.next, limit)
+      }
+    } else {
+      // [we-scene patch] 尾部走位失败：退回改动前的启发式路径（逐位一致）
+      const ev = parseAnimEvents(dv, o, limit)
+      events = ev.events
+      next = findNextAnimHeader(dv, ev.next, limit)
+    }
     if (tracks.length > 0 && frameCount > 0 && fps > 0) {
+      // 该动画是否真画了不透明度包络（任一曲线值 < 1-1e-4，= 官方 hasAlphaCurves 判据）
+      const hasAlpha = !!(
+        blendCurves && blendCurves.some((c) => c && c.length > 0 && c.some((v) => v < 1 - 1e-4))
+      )
       anims.push({
         id,
         name: nameR.value,
@@ -1234,12 +1477,14 @@ function parseAnimations(buf, dv, boneCount, a) {
         frameCount,
         duration: frameCount / fps,
         tracks,
-        events: ev.events,
+        events,
+        // [we-scene patch 2026-10-12] 每骨不透明度包络（0..1，样本数 = frameCount+1）
+        blendCurves,
+        scalarCurves,
+        hasAlpha,
       })
     }
-    // 下一条动画头：从事件末锚扫（无事件时事件末=轨道尾，锚点就在 35B 填充之后）
-    const next = findNextAnimHeader(dv, ev.next, limit)
-    if (next < 0) break
+    if (next < 0 || next >= limit) break
     o = next
   }
   void boneCount

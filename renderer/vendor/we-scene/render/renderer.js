@@ -1,4 +1,4 @@
-import { mat4Identity, mat4Multiply, mat4Ortho, mat4RotateX, mat4RotateY, mat4RotateZ, mat4Translate, mat4Scale, mat4Invert, mat4Transpose, mat4TransformPoint, buildCamera, buildLayerPerspectiveVP, layerParallaxOffset, resolveParallaxFormula, parallaxDepthFactor, layerWorldOrigin } from './math.js'
+import { mat4Identity, mat4Multiply, mat4Ortho, mat4RotateX, mat4RotateY, mat4RotateZ, mat4Translate, mat4Scale, mat4Invert, mat4Transpose, mat4TransformPoint, buildCamera, buildLayerPerspectiveVP, layerParallaxOffset, resolveParallaxFormula, parallaxDepthFactor, layerWorldOrigin, letterboxBands } from './math.js'
 import { hlsl2glsl } from './hlsl2glsl.js'
 // WebGL2 pass 管线：copy → 效果链（FBO 乒乓）→ 合成。层 FBO 正立（v-down）。
 // ALIGN/makeTexture* re-export 供 hittest / verify 与本文件共用同一份。
@@ -188,8 +188,15 @@ export function layerWantsPreserveBackdrop(layer) {
  * 已显式 passthrough 的 98 处路径不变。
  */
 export function layerWantsComposeBackdrop(layer) {
-  // 无子层的 composelayer：效果链输入必须是身后画面，不能是空画布。
-  return !!(layer && layer.isContainer && !layer.hasChildren)
+  // 无子层的 composelayer：效果链输入默认是身后画面（3798926489 的 crt/vhs/vignette 滤镜链、
+  // 官方真值证实必须喂身后画面）。但作者在 WE 编辑器里显式关掉「复制背景」时
+  // （copybackground === false，例：3351179520 的 393 circular_text / 103 音条）
+  // 层内容必须是自己的空画布，否则滤镜把整块背景副本重新合成一遍 ⇒ 画面中部出现大斜面。
+  if (!layer || !layer.isContainer || layer.hasChildren) return false
+  // 只有作者**显式**写进 scene.json 的 copybackground:false 才算「不要背景」；
+  // 键不存在时（3798926489 的 crt/vhs/vignette）仍是回读身后画面。
+  if (layer.copybackgroundExplicit && layer.copybackground === false) return false
+  return true
 }
 
 /**
@@ -439,8 +446,8 @@ export function layerColorAmbient(lightingEnabled, ambient) {
 //
 // **两条通道 × 两代衰减公式**（2026-09-24 定性；依据 = 官方 shader 明文
 // `local-assets/shaders/{common_pbr.h,common_pbr_2.h,common_fragment.h,generic*.frag}`
-// ＋ Waple 对 wallpaper64.exe 的逆向 `docs/re/scene-lighting.md`（给出生成器
-// `0x140169140` 打出的字符串原文），两者互证）：
+// ＋ 对本机已安装运行时（`wallpaper64.exe`）的只读静态分析
+// （见 `docs/re/scene-lighting.md`；给出生成器 `0x140169140` 打出的字符串原文），两者互证）：
 //
 //   ① **V1 通道**：`light` 串**带** `l` 前缀（lpoint/lspot/ltube/ldirectional）。
 //      引擎把 `color×intensity` 填 `g_LPoint_Color[i].rgb`、**radius 填同一个
@@ -448,7 +455,7 @@ export function layerColorAmbient(lightingEnabled, ambient) {
 //      槽位数装箱**（未写 lightconfig ⇒ 一盏都不装；`point` 这类老串被这条通道
 //      整个丢掉）。消费它的是 generic4 / genericimage4 这一代材质——官方那份
 //      `PerformLighting_V1` **不在 .frag 文件里**，是引擎按场景灯清单生成的字
-//      符串（Waple §2.1），正文转 `common_pbr_2.h::ComputePBRLightShadow`：
+//      符串（本地运行时清单实测），正文转 `common_pbr_2.h::ComputePBRLightShadow`：
 //          radiance = color×intensity × saturate(1 − d/radius)^exponent
 //      没有 1/d²：**radius 是衰减半径、exponent 是衰减指数**（这就是 scene.json
 //      里那个 exponent 的唯一读者）。
@@ -480,7 +487,7 @@ export function lightWorldPosition(light, cam) {
 
 /**
  * V1 通道的颜色槽：官方 `g_LPoint_Color[i].rgb = color × intensity`
- * （Waple §3.3 实测 `0x140193283`–`0x1401932c8`）。radius² 不在 CPU 侧预乘，
+ * （本地运行时实测 `0x140193283`–`0x1401932c8`）。radius² 不在 CPU 侧预乘，
  * 由着色器按模型决定要不要乘（老通道的 `g_LightsColorPremultiplied` 才是预乘版）。
  * 缺省 intensity 1（灯对象默认 0 只在作者没写时生效，本仓保留 1 以兼容无该字段
  * 的旧语料；全库有灯壁纸都显式写了 intensity 或绑了用户属性）。
@@ -1599,10 +1606,10 @@ export function createRenderer(canvas, opts = {}) {
   // 现在只有宿主显式 fade:true 才接线；场景显式写 false 的仍不放（缺省按关处理），
   // 默认无开场动画的壁纸不再叠加全局开场动画。
   const fadeEnabled = (general) => opts.fade === true && boolProp(general.camerafade, false)
-  // [we-scene patch 2026-09-27] camerashake 运动模型重写 —— 对齐 linux-wallpaperengine
-  // 的逆向实现（AzPepoze/linux-wallpaperengine src/wallpaper/2d/camera/parallax.cpp
+  // [we-scene patch 2026-09-27] camerashake 运动模型重写 —— 对齐另一份开源实现
+  // （linux-wallpaperengine src/wallpaper/2d/camera/parallax.cpp
   // 的 camera_shake_update；8 方向表 × {0.8,1.0,0.45,0.6} 系数这种组合不可能凭空
-  // 发明，按官方运行时行为逆向而来，Almamu 原版只是没实现、并非官方语义）。
+  // 发明，按官方运行时行为逐项标定而来，Almamu 原版只是没实现、并非官方语义）。
   // 旧实现（两条正弦乘积，issue#3 标定）的两处偏差（3463520581 amp=0.5 rough=1.0
   // speed=0.64 实测对比）：
   //   1. roughness 语义反了：旧码把它当 [0,1] 的低/高频混合权重，rough=1 → 100%
@@ -1612,7 +1619,7 @@ export function createRenderer(canvas, opts = {}) {
   //   2. 运动模型不同：官方是「8 方向节拍 + smoothstep 缓动 + 正弦旁弯」——
   //      每 (π/2)/(2·speed) 秒切一拍（奇数拍停在中心，速度过零），
   //      dir0→中心→dir1→中心… 的沉稳慢摆；正弦乘积则是连续往返。
-  //      同参数仿真：旧码峰值速度 ~38px/s vs 逆向实现 ~19px/s（4K），旧码快一倍。
+  //      同参数仿真：旧码峰值速度 ~38px/s vs 对齐实现 ~19px/s（4K），旧码快一倍。
   // 幅度：amp·min(viewW,viewH)·0.01（amp=1 → ±1% 短边；16:9 下 ≈ ±0.56% 视宽，
   // 与 issue#3 的 ±0.5% 同量级，标定不回退）。返回值直接是世界像素 ——
   // 旧版返回归一化值再由调用点乘比例，两处拆写让 verify 与实现漂移过，收敛到一处。
@@ -4109,6 +4116,48 @@ export function createRenderer(canvas, opts = {}) {
         }
         gl.uniformMatrix4fv(copyUni.mvp, false, IDENT_M4)
         gl.drawArrays(gl.TRIANGLES, 0, 6)
+      }
+    }
+    // [we-scene patch 2026-10-12] **contain 的 letterbox 遮罩：设计矩形之外一律画
+    // clearcolor**。fit=contain（「完整显示」）时可视窗口比设计矩形大（fitWindow 的
+    // 加高/加宽分支，例如 5120×1440 场景在 16:9 窗口得 5120×2880），而场景里
+    // **超出设计矩形的层内容照旧会画出来** —— 3264246690 的人物网格 y 到 2059、
+    // 斜向 DANGER 胶带端部 y 跨 −186..1812，全部落在设计矩形（0..1440）之外，于是
+    // 在上下黑边里露出「人物下半身浮在灰底上」的画面。用户看到的「适配完整显示时
+    // 人物后面的图层比例不对」正是这个：设计矩形只有 5120×1440，背景层当然止步于
+    // 1440，而 puppet 继续往下画。
+    // WE 的原生语义里场景是先渲染到**设计尺寸**的画布、再按 fit 合成进窗口的 ⇒
+    // 设计矩形之外的内容根本不存在于最终画面；这里按设计矩形的屏幕矩形把四边盖回
+    // clearColor，得到同一张最终图（只动帧末像素，不碰任何 FBO/效果链/puppet 变换）。
+    // 实现用「限制 viewport + 全屏纯色 quad」而不是 gl.scissor：本文件的屏幕空间
+    // gl.viewport 调用点散布（1110/2785/2857/3084/3098/3617/3738/3779/4096/4142/
+    // 4175/4460 等），一旦开启 scissor 就会误裁所有 FBO pass；此处只在帧末把几块
+    // 轴对齐矩形刷成纯色，副作用最小。只对 contain 生效：cover 的「peek 溢出」是
+    // 本仓有意为之的取景（view 可以超出设计矩形），不能被遮掉。
+    if (fit === 'contain' && !cam.perspective && cam.viewW > 0 && cam.viewH > 0) {
+      const rects = letterboxBands(cam.viewW, cam.viewH, cam.offX, cam.offY, cam.projW, cam.projH, width, height)
+      if (rects.length) {
+        const cc = frameClearColor || [0, 0, 0, 1]
+        gl.useProgram(copyProg)
+        gl.enable(gl.BLEND)
+        gl.blendFuncSeparate(gl.SRC_ALPHA, gl.ONE_MINUS_SRC_ALPHA, gl.ONE, gl.ONE_MINUS_SRC_ALPHA)
+        bindFinal()
+        gl.bindVertexArray(vao)
+        uploadQuad('pass', PASS_QUAD)
+        gl.activeTexture(gl.TEXTURE0)
+        gl.bindTexture(gl.TEXTURE_2D, whiteTex)
+        gl.uniform1i(copyUni.tex, 0)
+        gl.uniform4f(copyUni.color, cc[0], cc[1], cc[2], 1)
+        setFrameBasis(copyUni, null)
+        if (copyUni.blendPrep !== null && copyUni.blendPrep !== undefined) {
+          gl.uniform1i(copyUni.blendPrep, 0)
+        }
+        gl.uniformMatrix4fv(copyUni.mvp, false, IDENT_M4)
+        for (const r of rects) {
+          gl.viewport(r[0], r[1], r[2], r[3])
+          gl.drawArrays(gl.TRIANGLES, 0, 6)
+        }
+        gl.viewport(0, 0, width, height)
       }
     }
     // [we-scene patch] MSAA resolve：图层+camerafade 都画进了多重采样缓冲，

@@ -63,6 +63,24 @@ export function parseNum(v, dflt) {
 }
 
 /**
+ * 标量字段的「初值」读取：脚本/用户属性包装取快照 `.value`，纯数字直接解析。
+ *
+ * 与 `parseNum(v, dflt)` 的区别只在**纯数字列**：`parseNum` 只认 `number`（字符串
+ * 数字退回 dflt），而官方 scene.json 的灯光标量两种写法都有（`"intensity": 1` 与
+ * `"intensity": "1"`），所以标量读取要 `Number()` 一下再判有限。
+ *
+ * 用于 **[we-scene patch] 只解析不渲染** 的灯光阴影/体积字段（见下方灯光对象的
+ * `lightParams` 注释）：它们只进解析结果，渲染侧零消费者，判据见
+ * scripts/verify-props.mjs 的「灯光阴影/体积字段：只解析不渲染（D2）」一节。
+ */
+export function readLightNum(v, dflt) {
+  const raw = v !== null && typeof v === 'object' ? v.value : v
+  if (raw === undefined || raw === null) return dflt
+  const n = Number(raw)
+  return Number.isFinite(n) ? n : dflt
+}
+
+/**
  * 「渲染惰性纯容器」判据：无 image / model / particle / text 且无 size。
  * WE 只把这种「排版夹具」节点当分组用，**不把它的 scale 传给子层**
  * （3791354118 / 3264246690 的无名组 id 373，详见 composeChildTransform 内注释）。
@@ -576,10 +594,64 @@ export function parseScene(sceneJson, project) {
       // 标量字段的「初值」：脚本包装取快照 .value，纯数字/字符串直接解析。
       lightRadius: parseNum(o.radius && typeof o.radius === 'object' ? o.radius.value : o.radius, 1000),
       intensity: parseNum(o.intensity && typeof o.intensity === 'object' ? o.intensity.value : o.intensity, 1),
-      // exponent 缺省 2.0 = 官方 LightObject 注册表里的默认（Waple 逆向 §1.3：
-      // offset +0x2ec / 默认 0x1401904a8）。只有 V1 通道的灯用它（衰减指数），
-      // 老通道不吃这个字段。
+      // exponent 缺省 2.0，只有 V1 通道的灯用它（衰减指数），老通道不吃这个字段。
+      // 该缺省与消费侧一致（见 render/renderer.js:502-505）；原生出处待补，对账口径见
+      // docs/re/we-native-lighting-constants.md §3.1（未取到原生证据前不改常量）。
       exponent: parseNum(o.exponent && typeof o.exponent === 'object' ? o.exponent.value : o.exponent, 2),
+      // [we-scene patch 2026-10-12] **只解析不渲染（D2）**：官方光照对象的阴影/体积
+      // 字段。用户已拍板「只解析不渲染」——本仓不做阴影图集、不做体积光 RT、
+      // 不新增任何 uniform/program/draw/pass/RT，这些值**只进解析结果供宿主读取**，
+      // 唯一的消费判据是「渲染侧消费者为 0」（见 scripts/verify-props.mjs 的同名节，
+      // 每次跑都会重扫真实源码，防止后人顺手接上）。
+      //
+      // 为什么不直接在解析结果里保留 `srcObject` 就算了：`srcObject` 是**原始**
+      // JSON（字符串写 `"5"` 就是字符串、缺省键就是 undefined），宿主想读一个带
+      // 官方默认值的标量得自己再判一遍类型。这里把「解析出的默认值与类型」一次性
+      // 定死成下面这张表（全部 `number` / `boolean` / `string` 三种类型）：
+      //
+      //   键                     源字段           类型      官方缺省
+      //   castshadow             castshadow       boolean   false
+      //   cascadeDistance        cascadedistance0 number    0
+      //                          （另有 cascadedistance1/2，语料与 0 同值）
+      //   density                density          number    1
+      //   volumetricsExponent    volumetricsexponent number 1
+      //   castVolumetrics        castvolumetrics  boolean   false
+      //   innerCone              innercone        number    0
+      //   outerCone              outercone        number    0
+      //   cookie                 cookie           string    ''（纹素路径，空串 = 无）
+      //   cookieEnabled          usecookie        boolean   false
+      //   sourceSize             lightsourcesize  number    0
+      //
+      // **不是这里解析的**（已有语义，别按「只解析」误判）：
+      //   · `exponent` → 上方 `lightExponent`（V1 衰减指数，真消费：renderer 的
+      //     lightExponentOf → u_LightExponent）；
+      //   · `parent` → 下方 `parentId`（层级链接，已消费）；
+      //   · `visible`/`solid`/`parallaxDepth` → 各自的解析字段，已消费（不是灯光参数）。
+      lightParams: (typeof o.light === 'string' && o.light !== '') ? (() => {
+        // 纯数值/纯布尔一律照读；缺省键（undefined/null）落官方缺省。**只在灯对象上
+        // 装配**（非灯对象这里是 null）—— 非灯对象上的 `castshadow` 是文字层投影开关，
+        // 另有 `textCastshadow`（上方 :519 附近）在管，绝不能在这里给它补默认值。
+        const bool = (v, dflt) => (v === undefined || v === null ? dflt : parseBool(v, dflt))
+        const num = (v, dflt) => (v === undefined || v === null ? dflt : readLightNum(v, dflt))
+        const str = (v) => {
+          const raw = v !== null && typeof v === 'object' ? v.value : v
+          return typeof raw === 'string' ? raw : ''
+        }
+        return {
+          castshadow: bool(o.castshadow, false),
+          cascadeDistance: num(o.cascadedistance0, 0),
+          cascadeDistance1: num(o.cascadedistance1, 0),
+          cascadeDistance2: num(o.cascadedistance2, 0),
+          density: num(o.density, 1),
+          volumetricsExponent: num(o.volumetricsexponent, 1),
+          castVolumetrics: bool(o.castvolumetrics, false),
+          innerCone: num(o.innercone, 0),
+          outerCone: num(o.outercone, 0),
+          cookie: str(o.cookie),
+          cookieEnabled: bool(o.usecookie, false),
+          sourceSize: num(o.lightsourcesize, 0),
+        }
+      })() : null,
       // [we-scene patch] 字段关键帧动画（`animation: {c0:[...], options:{...}}`）。
       // 与 objectScripts 同理：不在这里留下来，渲染侧就只能读那份静态 `value` 快照。
       // 全库 126 处 / 25 张壁纸，三大挂载点是 effect 常量 `multiply`(32)、
@@ -682,6 +754,11 @@ export function parseScene(sceneJson, project) {
       alpha: parseNum(o.alpha, 1),
       brightness: parseNum(o.brightness, 1),
       copybackground: !!o.copybackground,
+      // 「作者显式关掉复制背景」与「scene.json 里根本没这个键」必须区分：
+      // 空 composelayer + 效果链默认要回读身后画面（3798926489 的 crt/vhs/vignette
+      // 就没写这个键），而作者显式写 copybackground:false 时层内容必须是自己的空画布
+      // （3351179520 的 393/103：回读会把背景副本经 perspective 重映射成斜置大面板）。
+      copybackgroundExplicit: o.copybackground !== undefined && o.copybackground !== null,
       colorBlendMode: o.colorBlendMode || 0,
       // 静态 perspective 旗标（全库 22 层 / 16 张，多为时钟/人物；3794216052 的
       // Audio/帧率显示带非零静态 X/Y 角 = 作者要固定 3D 倾斜）。脚本侧
@@ -785,6 +862,34 @@ export function parseScene(sceneJson, project) {
     }
     return Object.keys(out).length ? out : null
   })()
+  // [we-scene patch 2026-10-12] `general.lightconfig` 的**阴影/体积子开关**：只解析
+  // 不渲染（D2，同层上的 `lightParams`）。语料里 12 个场景有 lightconfig，子开关
+  // `pointshadow`/`directionalshadow`/`spotcookie` 各自出现（本机 358 场景语料实测）。
+  //
+  // 与 `general` 的关系：`general` 仍是**原始对象**（sceneJson.general 直传，下游
+  // `renderer.js` / `scene-mount.ts` 直接读 `general.ambientcolor` 等原始键，语义一律
+  // 不变）；这里是同一份的**归一化影子**，暴露为 `scene.lightconfig`，好让宿主不必
+  // 自己判类型、也不必把原始 general 换掉。
+  //
+  // 值是**槽位数**（0/1/2）而不是布尔：见 renderer.js 顶部的通道注释 ——「引擎把
+  // color×intensity 填 g_LPoint_Color[i].rgb、radius 填同一个 .w、exponent 填
+  // g_LPoint_Origin[i].w，并**只按 lightconfig 给的槽位数装箱**」（本仓装配上限
+  // 恒为 MAX_SCENE_LIGHTS=4，不读这个数）。缺省 1/1/0 与既有实现一致：
+  //   · pointshadow       ← lightconfig.pointshadow，缺省 1
+  //   · directionalshadow ← lightconfig.directionalshadow，缺省 1
+  //   · spotcookie        ← lightconfig.spotcookie，缺省 0
+  const lightconfig = (() => {
+    const raw = general.lightconfig && typeof general.lightconfig === 'object' ? general.lightconfig : {}
+    const intAt = (k, dflt) => {
+      const n = Number(raw[k] !== undefined && raw[k] !== null ? raw[k] : dflt)
+      return Number.isFinite(n) ? n : dflt
+    }
+    return {
+      pointshadow: intAt('pointshadow', 1),
+      directionalshadow: intAt('directionalshadow', 1),
+      spotcookie: intAt('spotcookie', 0),
+    }
+  })()
 
   // 空组（无 image/particle/model）上的 parallaxDepth 不会自己画出来。
   // 子层没写视差时要继承，否则分组节点的深度等于没写：3233141951 的 576
@@ -864,6 +969,8 @@ export function parseScene(sceneJson, project) {
     camera: sceneJson.camera || null,
     runtimeCamera,
     general,
+    // [we-scene patch 2026-10-12] lightconfig 的归一化影子（只解析不渲染，见定义处注释）。
+    lightconfig,
     generalScripts,
     generalAnimations,
     layers,
