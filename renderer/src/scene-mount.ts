@@ -3727,6 +3727,67 @@ export function mountScene(rt: Runtime, cfg: WallpaperConfig) {
       // ---- 声音图层（sound 对象）----
       // 从 scene.pkg 提取声音文件 → Blob → audio 播放；受 cfg.muted 控制
       const soundAudios: HTMLAudioElement[] = [];
+      // [we-scene patch] 释放系统「正在播放」槽位。Chromium/WebKit 里媒体元素只要
+      // 还挂着 src 就占着系统媒体会话：暂停不放手、muted 不放手、WebAudio 主增益
+      // 归零也不放手（Edge 实测，见 docs/CASEBOOK「系统正在播放被预览页抢走」）。
+      // 壁纸预览一旦占住槽位，系统/媒体桥读到的就是「WebWallGL 编辑器」而不是用户
+      // 真正的播放器 —— 歌名在、封面全丢。所以在「重新变静音 / 脚本 stop / 卸载」
+      // 三条路径上主动把 src 卸掉来释放；从未可听过（v 一直 0）的元素不动它，
+      // 免得影响壁纸自带播放面板的进度。
+      const soundSrcs = new WeakMap<HTMLAudioElement, string>();
+      const soundUnloaded = new WeakSet<HTMLAudioElement>();
+      const soundArmed = new WeakSet<HTMLAudioElement>();
+      const soundWant = new WeakSet<HTMLAudioElement>();
+      const soundPos = new WeakMap<HTMLAudioElement, number>();
+      const unloadSound = (au: HTMLAudioElement) => {
+        if (soundUnloaded.has(au)) return;
+        const src = au.getAttribute("src") || au.currentSrc || "";
+        if (!src) return;
+        soundSrcs.set(au, src);
+        try {
+          soundPos.set(au, au.currentTime);
+        } catch {
+          /* 忽略 */
+        }
+        try {
+          au.pause();
+        } catch {
+          /* 忽略 */
+        }
+        au.removeAttribute("src");
+        try {
+          au.load();
+        } catch {
+          /* 忽略 */
+        }
+        soundUnloaded.add(au);
+      };
+      const reloadSound = (au: HTMLAudioElement) => {
+        if (!soundUnloaded.has(au)) return;
+        const src = soundSrcs.get(au);
+        if (!src) return;
+        au.src = src;
+        soundUnloaded.delete(au);
+        const pos = soundPos.get(au) ?? 0;
+        if (pos > 0) {
+          au.addEventListener(
+            "loadedmetadata",
+            () => {
+              try {
+                au.currentTime = pos;
+              } catch {
+                /* 忽略 */
+              }
+            },
+            { once: true },
+          );
+        }
+        try {
+          au.load();
+        } catch {
+          /* 忽略 */
+        }
+      };
       // [we-scene patch] BGM 频谱桥（35 张「声音层 + 音频反应」壁纸）：声音元素
       // 接共享 AnalyserNode，每帧把 BGM 频域并入音频快照，让自带音乐也能驱动
       // g_AudioSpectrum* / registerAudioBuffers（见 bgm-analyser.ts）。
@@ -3757,11 +3818,18 @@ export function mountScene(rt: Runtime, cfg: WallpaperConfig) {
             au.muted = cfg.muted !== false;
             // 接入 BGM 频谱分析（createMediaElementSource 每元素仅一次，幂等）
             bgm.attach(au);
+            // 起点就可听（cfg.muted === false 且宿主音量为正）的元素一挂上就可能注册
+            // 系统「正在播放」会话，先记进 soundArmed：之后音量归零才会卸 src 释放它。
+            // 编辑器默认挂载是 muted=true、音量 0 ⇒ 不落这里，不会误卸。
+            if (!au.muted && effectiveUserVolume(rt, cfg) > 0) soundArmed.add(au);
             // startsilent：等脚本 thisLayer.play() 再响。2887099508 的 10 层语音/备选
             // BGM 都是 true，一律 play 会在加载瞬间把问候、翻页、五首 BGM 叠在一起。
             // 全库 59 层 / 11 张壁纸。playbackmode=single 的一次性语音也走这条。
             (layer as any).soundCtl = {
               play() {
+                // 之前可能为了释放系统槽位卸过 src，播之前先装回去
+                reloadSound(au);
+                soundWant.add(au);
                 if (au.ended) {
                   try {
                     au.currentTime = 0;
@@ -3776,15 +3844,22 @@ export function mountScene(rt: Runtime, cfg: WallpaperConfig) {
                 wallpaperAudio.markPlayed(au);
               },
               pause() {
+                soundWant.delete(au);
                 au.pause();
+                // 暂停的元素**仍然占着**系统「正在播放」槽位（实测：pause 后条目不变、只把状态
+                // 写成 paused）⇒ 可听过的元素暂停时一并卸 src；play() 会 reloadSound 装回并续位。
+                if (soundArmed.has(au)) unloadSound(au);
               },
               stop() {
+                soundWant.delete(au);
                 au.pause();
                 try {
                   au.currentTime = 0;
                 } catch {
                   /* 忽略 */
                 }
+                // 曾经可听过的元素可能正占着系统「正在播放」槽位，卸 src 才会释放
+                if (soundArmed.has(au)) unloadSound(au);
                 wallpaperAudio.markStopped(au);
               },
               isPlaying: () => !au.paused && !au.ended,
@@ -3796,6 +3871,7 @@ export function mountScene(rt: Runtime, cfg: WallpaperConfig) {
             // 登记进壁纸音频媒体源（跳歌/上一曲在这份有序表上循环）
             wallpaperAudio.register(au, layer.name || "");
             if (!layer.soundprops?.startsilent && !rt.paused) {
+              soundWant.add(au);
               bgm.resume();
               void au.play().catch(() => {});
             }
@@ -3822,10 +3898,34 @@ export function mountScene(rt: Runtime, cfg: WallpaperConfig) {
             au.volume = v;
             au.muted = v <= 0;
           }
+          // 可听过 → 记下「这个元素可能已抢到系统槽位」；转静音 → 卸 src 释放。
+          // 从未可听（v 一直 0）的元素不动：它不会注册媒体会话，卸了反而会打断
+          // 壁纸自带播放面板的进度条。
+          if (v > 0) {
+            soundArmed.add(au);
+            if (soundUnloaded.has(au) && soundWant.has(au)) {
+              reloadSound(au);
+              void au.play().catch(() => {});
+            }
+          } else if (soundArmed.has(au)) {
+            unloadSound(au);
+          }
         }
         bgm.setVolume(v);
       };
-      rt.sceneAudio = { setVolume: setSceneVolume, audios: soundAudios, dispose: bgmCleanup };
+      rt.sceneAudio = {
+        setVolume: setSceneVolume,
+        audios: soundAudios,
+        // 暂停/遮挡暂停时也必须交还系统「正在播放」槽位：paused 的元素仍占着条目
+        // （实测：pause 之后条目保持，只把状态写成 paused），引擎 pauseImpl 会调这里。
+        releaseSlots: () => {
+          for (const au of soundAudios) if (soundArmed.has(au)) unloadSound(au);
+        },
+        reclaimSlots: () => {
+          for (const au of soundAudios) if (soundUnloaded.has(au) && soundWant.has(au)) reloadSound(au);
+        },
+        dispose: bgmCleanup,
+      };
       // 每次挂载/重挂装配完声音层就重放宿主音量：新元素只带 cfg.muted 的 0/1
       // 近似（setRenderDpr/restore 等内部重挂会丢中间值），且 WKWebView 上元素
       // muted 对 WebAudio 路由不生效，必须经这里（→ bgm 增益）重落一次。
@@ -7488,6 +7588,8 @@ export function mountScene(rt: Runtime, cfg: WallpaperConfig) {
             au.pause();
           }
         }
+        // 暂停期间也要把系统「正在播放」槽位交还用户播放器：paused 的元素仍占着条目
+        rt.sceneAudio?.releaseSlots?.();
       };
       resumeImpl = () => {
         if (pauseStarted) {
@@ -7504,6 +7606,8 @@ export function mountScene(rt: Runtime, cfg: WallpaperConfig) {
           }
         }
         playingVideos.length = 0;
+        // 暂停时卸过 src 才能交还系统槽位，恢复前先装回去（含暂停前的位置）
+        rt.sceneAudio?.reclaimSlots?.();
         for (const au of playingAudios) void au.play().catch(() => {});
         playingAudios.length = 0;
         // 恢复后首帧立即出，不被暂停期间冻结的节拍相位挡住

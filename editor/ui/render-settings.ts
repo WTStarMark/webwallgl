@@ -6,7 +6,7 @@
 // 「音频频谱条」效果、粒子音频门控、文字脚本 registerAudioBuffers）才会跟着系统声音动。
 // 试听元素接进来的频谱源（setPreviewAudio）优先于系统音频：点「试听」时看的是那首歌。
 
-import type { AntiAliasingMode, AudioSource, MountOptions, ParticleQuality, PostQuality, SceneInstance } from "../../renderer/src/api/editor";
+import type { AntiAliasingMode, AudioSource, MediaSource, MountOptions, ParticleQuality, PostQuality, SceneInstance } from "../../renderer/src/api/editor";
 import { createSystemAudioSource, mountAudioMeter, type AudioSourceStatus, type BandsSource } from "../audio-live";
 import { et } from "../i18n";
 
@@ -32,8 +32,8 @@ export type RenderSettingsOptions = {
 
 export type RenderSettings = {
   fpsCap(): number;
-  /** 挂载期选项：fps / volume / quality，开着系统音频时再带 audio */
-  mountOptions(): Pick<MountOptions, "fps" | "volume" | "quality"> & { audio?: AudioSource };
+  /** 挂载期选项：fps / volume / quality，开着系统音频时再带 audio 与媒体源 */
+  mountOptions(): Pick<MountOptions, "fps" | "volume" | "quality"> & { audio?: AudioSource; media?: MediaSource };
   /** 试听元素的分析源（null = 试听结束，回落到系统音频 / 引擎内置源） */
   setPreviewAudio(src: LiveBandsSource | null): void;
 };
@@ -90,10 +90,13 @@ export function mountRenderSettings(o: RenderSettingsOptions): RenderSettings {
     et(s === "live" ? "audio.live" : s === "preview" ? "audio.previewing" : s === "idle" ? "audio.idle" : "audio.off");
   const syncAudioStatus = () => (o.audioStatus.textContent = statusText(activeSrc()?.status() ?? "off"));
   meter.onFrame(syncAudioStatus);
-  /** 开/关/换源都走这里：挂载后热更引擎音频源 + 电平条 + 状态文案 */
+  /** 开/关/换源都走这里：挂载后热更引擎音频源 + 媒体源 + 电平条 + 状态文案 */
   const applyAudio = () => {
     const src = activeSrc();
     o.instance()?.setAudio(src);
+    // 封面走同一条系统实况：频谱和 Now Playing 是宿主同一个 SSE 推下来的，
+    // 只装频谱就会出现「音条会动、封面不出来」。关掉时交回引擎内置媒体源。
+    o.instance()?.setMedia(o.sysAudio.checked ? sys.media() : null);
     meter.setSource(src);
     syncAudioStatus();
   };
@@ -131,7 +134,7 @@ export function mountRenderSettings(o: RenderSettingsOptions): RenderSettings {
   return {
     fpsCap: () => Number(o.fps.value),
     mountOptions: () => {
-      const opts: Pick<MountOptions, "fps" | "volume" | "quality"> & { audio?: AudioSource } = {
+      const opts: Pick<MountOptions, "fps" | "volume" | "quality"> & { audio?: AudioSource; media?: MediaSource } = {
         fps: Number(o.fps.value),
         volume: Number(o.volume.value),
         quality: quality(),
@@ -140,6 +143,8 @@ export function mountRenderSettings(o: RenderSettingsOptions): RenderSettings {
       // 传 null 会连引擎内置的 BGM 分析一起关掉（音频反应层连壁纸自带的歌都不跟）。
       const src = activeSrc();
       if (src) opts.audio = src;
+      // 系统媒体源（封面 / 歌名）与系统音频同一个开关：媒体键同理只在开时才带。
+      if (o.sysAudio.checked) opts.media = sys.media();
       return opts;
     },
     setPreviewAudio: (src) => {

@@ -10569,6 +10569,16 @@ let previewAudio: ElementAudioSource | null = null;
 function stopPreview() {
   if (!preview) return;
   preview.au.pause();
+  // 释放系统「正在播放」槽位：Chromium/WebKit 的媒体元素只要还挂着 src（哪怕已
+  // 暂停、哪怕 muted）页就一直占着系统媒体会话 —— 于是系统/媒体桥读到的是
+  // 「WebWallGL 编辑器」（无封面），而不是用户真正的播放器，封面全丢。只有把
+  // src 卸掉（removeAttribute + load()）才当场释放（Edge 实测，见 docs/CASEBOOK）。
+  try {
+    preview.au.removeAttribute("src");
+    preview.au.load();
+  } catch {
+    /* 元素已销毁等情况忽略 */
+  }
   URL.revokeObjectURL(preview.url);
   preview = null;
   previewAudio?.dispose();

@@ -13,6 +13,13 @@
 // 两条源都不依赖渲染器：一条听宿主 `/api/system/stream` 的 SSE（系统输出 loopback），
 // 一条给试听的 HTMLAudioElement 挂 AnalyserNode。拿不到数据时一律喂全零快照
 // （引擎注释：GL uniform 数组不设置会保留上一帧的值，静默必须显式喂零）。
+//
+// 系统那条 SSE 除了频谱还带宿主那份 media 快照（title/artist/album/hasArtwork）：
+// 编辑器预览的封面（$mediaThumbnail）就走它 —— 那条 media 折成一个 MediaSource 交给
+// 引擎，封面 URL 指向宿主的 /api/system/artwork（scene-mount 按 URL 变化 fetch + 上传）。
+// 之前这里只读 `msg.audio.bands`，media 整块被丢掉，于是「音条会动、封面不出来」。
+
+import { createMediaSource, type MediaSource } from "../renderer/src/api/editor";
 
 /** 引擎要的形状：左右各 64 段，0..1 */
 export type Bands = { left: Float32Array; right: Float32Array };
@@ -80,11 +87,45 @@ export function meterLevels(bands: Bands, bars = 16): number[] {
   return out;
 }
 
+/** 宿主 SSE 里那份 media 快照（host/system-live.ts 的 LiveMediaSnap 子集） */
+export type RawSystemMedia = {
+  hasMedia?: boolean;
+  /** 1=播放 2=暂停（host/system-live.ts 的取值） */
+  state?: number;
+  title?: string;
+  artist?: string;
+  album?: string;
+  /** 秒 */
+  position?: number;
+  duration?: number;
+  hasArtwork?: boolean;
+};
+
+/** 媒体控制转发给宿主端点：编辑器自己没有播放器，控制面属于 media-bridge */
+function postMediaControl(origin: string, action: string): void {
+  try {
+    void fetch(`${origin}/api/system/media-control`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ action }),
+    }).catch(() => {
+      /* 端点不在（纯静态预览）就静默：控制面本来就允许无效 */
+    });
+  } catch {
+    /* 同上 */
+  }
+}
+
 export type SystemAudioSource = BandsSource & {
   /** 开听宿主 SSE（幂等；重复调用不叠加连接） */
   start(): void;
   stop(): void;
   status(): AudioSourceStatus;
+  /**
+   * 同一条 SSE 上的系统媒体源（Now Playing + 封面）。
+   * 对象**恒为同一个**（挂载时带上、之后随 SSE 热更），可直接 setMedia()/MountOptions.media。
+   */
+  media(): MediaSource;
   dispose(): void;
 };
 
@@ -97,17 +138,68 @@ export function createSystemAudioSource(origin = ""): SystemAudioSource {
   let es: EventSource | null = null;
   let cur: Bands | null = null;
   let at = 0;
+  // Now Playing 那条：库里 createMediaSource 会把配色/歌词行补全（手工拼快照会漏掉
+  // 五个可链式颜色对象，脚本一调 subtract/multiply 就 TypeError 熔断）。
+  const mediaSrc = createMediaSource(
+    { hasMedia: false, state: 0, hasThumbnail: false },
+    {
+      skipNext: () => postMediaControl(origin, "skipNext"),
+      skipPrevious: () => postMediaControl(origin, "skipPrevious"),
+      play: () => postMediaControl(origin, "play"),
+      pause: () => postMediaControl(origin, "pause"),
+      playPause: () => postMediaControl(origin, "playPause"),
+    },
+  );
+  /** 上一次的曲目键（含有无封面）：决定要不要换封面 URL */
+  let mediaKey = "";
+  const applyMedia = (m: RawSystemMedia | null | undefined) => {
+    if (!m || m.hasMedia !== true) {
+      if (mediaKey === "") return;
+      mediaKey = "";
+      mediaSrc.set({ hasMedia: false, state: 0, title: "", artist: "", album: "", position: 0, duration: 0, hasThumbnail: false, thumbnail: undefined });
+      return;
+    }
+    const title = String(m.title ?? "");
+    const artist = String(m.artist ?? "");
+    const album = String(m.album ?? "");
+    const hasArtwork = m.hasArtwork === true;
+    // 曲目 / 有无封面没变就不重写 thumbnail：scene-mount 是按 URL 变化判重的，
+    // 每 500ms 换个新 URL 会让场景反复 fetch + 重传 $mediaThumbnail。
+    const key = `${title}|${artist}|${album}|${hasArtwork ? 1 : 0}`;
+    const fresh = key !== mediaKey;
+    mediaKey = key;
+    mediaSrc.set({
+      hasMedia: true,
+      state: m.state === 2 ? 2 : 1,
+      title,
+      artist,
+      album,
+      position: Number(m.position) || 0,
+      duration: Number(m.duration) || 0,
+      hasThumbnail: hasArtwork,
+      // 只在换曲/封面有无变化时改 URL：封面本体走 /api/system/artwork（二进制，不进 SSE）
+      ...(fresh
+        ? { thumbnail: hasArtwork ? `${origin}/api/system/artwork?k=${encodeURIComponent(`${title}|${artist}|${album}`)}` : undefined }
+        : {}),
+    });
+  };
   const src: SystemAudioSource = {
+    media: () => mediaSrc,
     start() {
       if (es || typeof EventSource === "undefined") return;
       es = new EventSource(`${origin}/api/system/stream`);
       es.onmessage = (ev: MessageEvent<string>) => {
         try {
-          const msg = JSON.parse(ev.data) as { audio?: { bands?: number[] } };
+          const msg = JSON.parse(ev.data) as { audio?: { bands?: number[] }; media?: RawSystemMedia };
           const bands = bandsFromFrame(msg.audio?.bands);
-          if (!bands) return;
-          cur = bands;
-          at = Date.now();
+          if (bands) {
+            cur = bands;
+            at = Date.now();
+          }
+          // 只认「带 media 字段」的报文：宿主频谱帧（{audio}）与 media 帧（{media,window,…}）
+          // 是同一条 SSE 上的两种报文，频谱帧约 30Hz、media 帧约 2Hz —— 把频谱帧当成
+          // 「没在播」会把刚收到的封面/歌名按 30Hz 洗掉（实测就是封面永远出不来）。
+          if (msg.media !== undefined && msg.media !== null) applyMedia(msg.media);
         } catch {
           /* 单帧不规范就当没收到，等下一帧 */
         }

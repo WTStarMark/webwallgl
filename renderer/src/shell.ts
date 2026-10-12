@@ -90,7 +90,15 @@ export type Runtime = {
   ctx?: CanvasRenderingContext2D;
   raf?: number;
   sceneCleanup?: () => void;
-  sceneAudio?: { setVolume: (vol: number) => void; audios: HTMLAudioElement[]; dispose?: () => void };
+  sceneAudio?: {
+    setVolume: (vol: number) => void;
+    audios: HTMLAudioElement[];
+    /** 交还系统「正在播放」槽位：卸载每个元素的 src（暂停/静音时必须调，见 docs/CASEBOOK） */
+    releaseSlots?: () => void;
+    /** 恢复：把卸掉的 src 装回去（含暂停前的位置），供 resume 前调用 */
+    reclaimSlots?: () => void;
+    dispose?: () => void;
+  };
   /**
    * 宿主经 setVolume 下发过的**精确**音量（0..1）。库内部的重挂（setRenderDpr /
    * restore / 质量回退等）会重建媒体元素，元素只按 cfg.muted 近似成 0/1 ——
