@@ -631,7 +631,7 @@ export function createMDLRenderer(gl) {
         ensureMesh(legacyMeshOf(mdl))
       }
     },
-    // opts: { color:[r,g,b,a], time, animLayers, blending, overrideTex, keepZ, meshTextures }
+    // opts: { color:[r,g,b,a], time, animLayers, blending, overrideTex, keepZ, meshTextures, meshBlending, meshSkip }
     // overrideTex：puppet 层跑过效果链时采样源是链尾 FBO 的纹理，而不是原始贴图
     // （效果在贴图空间合成，见 renderer.js 中部那段长注释）。传裸 WebGLTexture。
     // keepZ：顶点 z 是否参与投影（透视场景的真 3D 网格 = true，2D puppet = 缺省 false）。
@@ -783,6 +783,11 @@ export function createMDLRenderer(gl) {
       for (let k = 0; k < n; k++) {
         // 绘制顺序由 meshDrawOrder 决定（F50）；单网格/未给排序表时 gi === k（逐位不变）。
         const gi = order ? order[k] : k
+        // [we-scene patch 2026-10-12] **通道图烘焙子网格不上可见画布**：宿主按材质判定后
+        // 在这里跳过（判据见 renderer/src/channel-bake.ts，引擎只认标记）。3441873795 的
+        // Kirby：mesh1 = 两个 1:1 覆盖 226×175 通道图的四边形，停在模型右上角 ——
+        // 画出来就是右上角那两个缩小、被竖直硬边切开的角色碎片（官方桌面端那里是干净的）。
+        if (opts.meshSkip && opts.meshSkip[gi]) continue
         const mesh = list ? list[gi] : legacyMesh
         if (!mesh || !mesh.vertexCount || !mesh.indexCount) continue
         const m = ensureMesh(mesh)

@@ -3448,6 +3448,9 @@ export function createRenderer(canvas, opts = {}) {
       // 「显式声明不透明的先画、其余后画」排序 —— 树卡片这类 alpha 网格要排在它身后的
       // 楼房之后，透明像素才不会把楼房写没（3477054430「树图层黑色方块」）。
       meshBlending: layer.meshBlending || null,
+      // [we-scene patch 2026-10-12] 通道图烘焙子网格（宿主判定，见 renderer/src/channel-bake.ts）：
+      // 索引为 true 的子网格不画 —— 它们是烘焙目标，不是画面（3441873795 的「角色碎片」）。
+      meshSkip: layer.meshSkip || null,
     })
     // [we-scene patch] 链尾 FBO 由同尺寸的层共享（getFBO 池）：其他层（图片层
     // compositeLayer 1:1 或放大采样）不能吃到这里的 trilinear + 本帧 mip ——

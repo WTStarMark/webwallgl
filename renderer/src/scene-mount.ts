@@ -89,6 +89,8 @@ import {
 import { sanitizeFontForBrowser } from "../vendor/we-scene/render/font-sanitize.js";
 import { decodeTexImageBitmap, resampleRgba } from "./tex-decode";
 import { encodeTexVideo, mp4Size } from "../vendor/we-scene/pkg/tex-write.js";
+// [we-scene patch 2026-10-12] 通道图烘焙子网格判定（3441873795 的「裂开的角色」）
+import { boxOfVertices, channelBakeSkipFlags, isChannelBakeSubMesh } from "./channel-bake";
 
 /**
  * [we-scene patch 2026-09-28] 平行光强度 → 漫反射系数的标定常数。
@@ -4201,6 +4203,15 @@ export function mountScene(rt: Runtime, cfg: WallpaperConfig) {
             reportDiag(rt, cfg, `puppet '${layer.name}' 无贴图，跳过`, "warn");
             continue;
           }
+          // [we-scene patch 2026-10-12] **通道图烘焙子网格不上可见画布**（与下面 3D 模型那条
+          // 分支同一套判据，见 channel-bake.ts 头注）：3441873795 的 Kirby 是 2D 木偶层、走的
+          // 就是这条分支，只在 3D 分支判定会静默失效 —— mesh1（两个 1:1 覆盖 226×175 通道图的
+          // 四边形）会被当普通网格画出来，就是右上角那两个缩小、被竖直硬边切开的角色碎片。
+          const skipFlags = await channelBakeSkipFlags(mdlObj as any, readAsset, readMaterialDoc);
+          if (skipFlags) {
+            (layer as any).meshSkip = skipFlags;
+            reportDiag(rt, cfg, `puppet '${layer.name}' 跳过通道图烘焙子网格 ${skipFlags.map((f, i) => (f ? 'mesh' + i : null)).filter(Boolean).join(',')}`, "info");
+          }
           layer.puppet = mdlObj;
           await wireMaskTextures(layer, mdlObj);
           // 编辑器只读面（getModelInfo）用：模型来自哪里、各子网格实际加载的贴图
@@ -4375,6 +4386,12 @@ export function mountScene(rt: Runtime, cfg: WallpaperConfig) {
             // [we-scene patch 2026-10-04] 逐网格 blending（F50 排序用）：mesh0 用层级那份，
             // 其余按各自材质读；缺材质/缺字段一律 null = 「未声明」= 可能透明 → 排后面。
             const meshBlend: (string | null)[] = [firstBlending];
+            // [we-scene patch 2026-10-12] **通道图烘焙子网格不上可见画布**（判据见
+            // channel-bake.ts 头注）：3441873795 的 Kirby 有 2 个子网格，mesh1 是覆盖
+            // 226×175 通道图的两个四边形，停在模型右上角 —— 画出来就是那两个缩小、被竖直
+            // 硬边切开的「角色碎片」，而官方桌面端同一位置是干净的。
+            const meshSkip: boolean[] = new Array(mdlObj.meshes.length).fill(false);
+            const baseBox = boxOfVertices(mdlObj.meshes[0]?.positions as ArrayLike<number> | undefined);
             for (let mi = 0; mi < mdlObj.meshes.length; mi++) {
               const mesh = mdlObj.meshes[mi];
               const mp: string | null = mesh.materialPath;
@@ -4392,6 +4409,21 @@ export function mountScene(rt: Runtime, cfg: WallpaperConfig) {
               const material = readMaterialDoc(matEntry);
               const pass0 = material?.passes?.[0];
               meshBlend.push(typeof pass0?.blending === "string" ? pass0.blending : null);
+              // [we-scene patch 2026-10-12] 通道图烘焙件：只标标记，不画（判据在纯函数里）
+              if (
+                isChannelBakeSubMesh({
+                  meshCount: mdlObj.meshes.length,
+                  shader: pass0?.shader,
+                  materialPath: mp,
+                  texture0: Array.isArray(pass0?.textures) ? pass0.textures[0] : null,
+                  vertexCount: mesh.vertexCount,
+                  selfBox: boxOfVertices(mesh.positions as ArrayLike<number> | undefined),
+                  baseBox,
+                })
+              ) {
+                meshSkip[mi] = true;
+                reportDiag(rt, cfg, `model '${layer.name}' 跳过通道图烘焙子网格 mesh${mi}（${mp}）`, "info");
+              }
               let spec: any = null;
               if (pass0 && typeof pass0.shader === "string" && eff.canUseMaterialMeshPath(pass0.shader)) {
                 spec = {
@@ -4450,6 +4482,8 @@ export function mountScene(rt: Runtime, cfg: WallpaperConfig) {
             (layer as any).meshTextures = meshTex;
             (layer as any).meshMaterials = meshSpecs;
             (layer as any).meshBlending = meshBlend;
+            // [we-scene patch 2026-10-12] 一个都没命中时保持 null ⇒ 渲染侧与改动前逐位一致。
+            (layer as any).meshSkip = meshSkip.some(Boolean) ? meshSkip : null;
           }
           // [we-scene patch 2026-10-12] 掩码贴图（见 `wireMaskTextures`）：这条网格/材质
           // 路径与 puppet 路径**都必须接**，否则掩码通道在另一条路径上静默失效。
@@ -4559,6 +4593,11 @@ export function mountScene(rt: Runtime, cfg: WallpaperConfig) {
                 // 护栏就是这么被吞掉的：verify-mdl-depth 断言的是两侧的源码文本，
                 // 抓不到这中间的转发断点）。接线断言见 verify-mdl-depth 的 F50 节。
                 meshBlending: (layer as any).meshBlending || null,
+                // [we-scene patch 2026-10-12] **通道图烘焙子网格**（父级判出、见 channel-bake.ts）。
+                // 这一行是必须的：renderer 那侧的 opts 只是「提议」，真正调 mdlRenderer.draw 的是
+                // 本回调，它按字段挑着转发 —— 漏一行就等于判定在实机上从未生效（上面 F49 的天空盒
+                // 护栏就是这么被吞掉的）。接线断言见 verify-channel-bake 的转发一节。
+                meshSkip: (layer as any).meshSkip || null,
                 skybox: !!layer.isSkybox,
                 // [we-scene patch 2026-09-28] 场景光照 + 法线矩阵（只在网格带法线时生效）。
                 // [we-scene patch 2026-10-09] layerLight = 场景灯 ?? 编辑器导入网格的默认主光
