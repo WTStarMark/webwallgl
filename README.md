@@ -51,14 +51,18 @@ pnpm add webwallgl   # 或 npm i webwallgl
 
 **场景编辑器**
 
-播放与编辑在同一个工作台里：左栏「壁纸库」点一下就播放，同时可以直接改。改动先留在内存里，按 ⌘S 另存为项目文件夹后自动保存（壁纸库里的原文件永远不改），导出时再打成官方 Wallpaper Engine 能直接加载的 scene.pkg。
+播放与编辑在同一个工作台里：左栏「壁纸库」点一下就播放，同时可以直接改。新建的工程默认存在浏览器存储里（刷新、重开都还在）并自动保存，想拿到松散文件就「存到本机文件夹…」；从壁纸库打开的壁纸按 ⌘S 另存为项目文件夹后同样自动保存（壁纸库里的原文件永远不改）。导出时再打成官方 Wallpaper Engine 能直接加载的 scene.pkg。
 
-- 新建与打开：新建空白或以图片为背景的项目；打开项目文件夹，或把 scene.pkg 解成松散工程再编辑；图片、视频、音频直接拖进画面就成为图层
-- 图层：图片、文字（文字 / 时钟 / 日期）、粒子（雪、雨、火花、光点）、视频（不是 H.264 的自动转码）、声音、模型；画面上点选、拖动、缩放、旋转，Alt + 点击在叠在一起的图层间切换；图层树里成组、拖动调整父子关系、显示 / 锁定、就地改名；全部操作可撤销
-- 模型与动画：导入 glTF / GLB / FBX / OBJ / DAE / STL / PLY / 3DS，带骨骼的转成可动画的 puppet、否则转成网格；骨骼姿势编辑、动画片段增删与帧事件、图层关键帧动画；还能把一张图片变成会摆动的网格
-- 效果：颜色叠加、色彩调整、暗角、模糊、波浪、滚动、呼吸，以及插件提供的效果；参数面板按参数表自动生成，支持多 pass + FBO；外来壁纸自带的效果也能识别并调整
-- 逻辑：用户属性（滑条、颜色、开关、下拉、文本）可绑到图层的可见、不透明度、亮度、缩放、颜色、文本上；给图层字段挂 SceneScript 脚本，边写边检查语法和入口函数
+- 新建与打开：新建空白或以图片为背景的工程；工程默认在浏览器存储里，也可以打开本机文件夹、或把 scene.pkg 解成松散工程再编辑；上次没保存完的内容会以横幅提示恢复；图片、视频、音频直接拖进画面就成为图层
+- 图层：图片、文字（文字 / 时钟 / 日期）、粒子（雪、雨、火花、光点）、视频（不是 H.264 的自动转码）、声音、模型、容器层、全屏后期层、相机与灯光层；画面上点选、拖动、缩放、旋转，Alt + 点击在叠在一起的图层间切换；图层树里成组、拖动调整父子关系、显示 / 锁定、就地改名；全部操作可撤销
+- 模型与动画：导入 glTF / GLB / FBX / OBJ / DAE / STL / PLY / 3DS，带骨骼的转成可动画的 puppet、否则转成网格；骨骼姿势编辑、动画片段增删与帧事件；时间轴按属性分行，拖动播放头、逐帧微调（←/→ 挪 1 帧、⇧ 10 帧）、关键帧删除与平滑 / 线性切换
+- 操控变形：把一张图片转成按像素建网格的木偶，拖钉子实时拉形变，再记录进 .mdl 片段或直接烘焙
+- 效果：颜色叠加、色彩调整、暗角、模糊、波浪、滚动、呼吸，以及插件提供的效果；参数面板按参数表自动生成，支持多 pass + FBO；外来壁纸自带的效果能识别并直接在检视器里调；「效果库」可以引用本机壁纸库里的效果目录
+- 逻辑：用户属性（滑条、颜色、开关、下拉、文本）可绑到图层的可见、不透明度、亮度、缩放、颜色、文本上；给图层字段挂 SceneScript 脚本，新建时挑 8 类生命周期模板，边写边检查语法和入口函数
+- 场景设置：直接改这份壁纸自己的 scene.json 参数（清屏与环境光、相机、相机抖动、鼠标视差、泛光 / HDR），写进工程、可撤销，和本机的「渲染选项」分开
 - 检视器分为属性 / 动画 / 模型 / 效果 / 逻辑 / 信息几个标签，只显示跟当前图层有关的；支持多选批量修改
+- 系统实况：把系统正在播放的声音频谱与「正在播放」信息（歌名 / 封面）喂给引擎；播放器自己不给封面时，宿主会按「歌名 + 歌手」去公开曲库补一张
+- 命令面板与无障碍：⌘K 打开命令面板，命令与快捷键都来自注册表（插件登记的也在里面）；图层树支持键盘操作
 - 预览：播放 / 暂停、逐帧、拖动时间轴、倍速，可切换宽高比、适配方式、渲染 DPR，可看实时帧率曲线
 - 导出：scene.pkg（贴图自动转为 .tex）、松散工程 zip、创意工坊上传用的目录、逐帧渲染的 mp4 视频、当前帧 PNG。导出前会用引擎自己的解析器把产物再读一遍做兼容性检查，有问题先写进控制台并让你确认
 
@@ -174,14 +178,18 @@ The full guide lives in the workbench: run `pnpm install && pnpm dev`, open <htt
 
 **Scene editor**
 
-Playing and editing share one workbench: click an item in the Library tab to play it and edit it right away. Changes stay in memory until ⌘S saves them as a project folder, after which they autosave (library files are never modified); export packs the result into a scene.pkg the official Wallpaper Engine loads directly.
+Playing and editing share one workbench: click an item in the Library tab to play it and edit it right away. New projects live in this machine's browser storage by default (they survive a reload or restart) and autosave; use "Save to local folder…" when you want loose files. A wallpaper opened from the library starts autosaving once ⌘S saves it as a project folder (library files are never modified). Export packs the result into a scene.pkg the official Wallpaper Engine loads directly.
 
-- Create and open: start a blank project or one with an image background; open a project folder, or unpack a scene.pkg into a loose project; drop images, videos or audio onto the viewport to turn them into layers
-- Layers: image, text (text / clock / date), particles (snow, rain, embers, bokeh), video (non-H.264 is transcoded automatically), sound and models; pick, move, scale and rotate on the canvas, Alt + click to cycle through stacked layers; group, re-parent by dragging, toggle visibility / lock and rename in place in the layer tree; everything is undoable
-- Models and animation: import glTF / GLB / FBX / OBJ / DAE / STL / PLY / 3DS — rigged models become animatable puppets, others become meshes; edit bone poses, add / remove animation clips and frame events, keyframe layers; or turn an image into a swaying mesh
-- Effects: tint, color adjust, vignette, blur, wave, scroll, pulse and plugin-provided effects; parameter panels are generated from the param table, with multi-pass + FBO support; effects shipped with third-party wallpapers are recognized and adjustable too
-- Logic: bind user properties (slider, color, bool, combo, text) to a layer's visibility, opacity, brightness, scale, color or text; attach SceneScript to layer fields, with syntax and entry-point checks as you type
+- Create and open: start a blank project or one with an image background; projects live in browser storage by default, and you can also open a local folder or unpack a scene.pkg into a loose project; unsaved work from last time is offered back on a banner; drop images, videos or audio onto the viewport to turn them into layers
+- Layers: image, text (text / clock / date), particles (snow, rain, embers, bokeh), video (non-H.264 is transcoded automatically), sound, models, container layers, full-screen post layers, and camera / light layers; pick, move, scale and rotate on the canvas, Alt + click to cycle through stacked layers; group, re-parent by dragging, toggle visibility / lock and rename in place in the layer tree; everything is undoable
+- Models and animation: import glTF / GLB / FBX / OBJ / DAE / STL / PLY / 3DS — rigged models become animatable puppets, others become meshes; edit bone poses, add / remove animation clips and frame events; the timeline splits lanes per field, scrubs, nudges keyframes (←/→ for 1 frame, ⇧ for 10) and toggles smooth / linear
+- Puppet warp: turn an image into a pixel-built mesh puppet, drag pins for a live deformation, then record it into the .mdl clip or bake it
+- Effects: tint, color adjust, vignette, blur, wave, scroll, pulse and plugin-provided effects; parameter panels are generated from the param table, with multi-pass + FBO support; effects shipped with third-party wallpapers are recognized and editable right in the inspector, and the effect library brings in loose effect folders from your local wallpaper library
+- Logic: bind user properties (slider, color, bool, combo, text) to a layer's visibility, opacity, brightness, scale, color or text; attach SceneScript to layer fields, picking one of 8 lifecycle templates, with syntax and entry-point checks as you type
+- Scene settings: edit the wallpaper's own scene.json parameters (clear & ambient, camera, camera shake, mouse parallax, bloom / HDR) — written into the project, undoable, kept apart from the local "Render options"
 - The inspector is split into Properties / Animation / Model / Effects / Logic / Info tabs and only shows the ones that apply to the selected layer; multi-selection edits work too
+- System live: feeds the spectrum and now-playing info (title / cover) of what your system is playing to the engine; when the player offers no artwork the host fetches one by title + artist from public catalogues
+- Command palette and accessibility: ⌘K opens the palette, with commands and shortcuts built from the registry (plugin-registered ones included); the layer tree is keyboard-operable
 - Preview: play / pause, frame stepping, scrubbing and speed; switch aspect ratio, fit and render DPR; watch a live frame-rate graph
 - Export: scene.pkg (textures converted to .tex), a zip of the loose project, a Workshop upload folder, a frame-by-frame rendered mp4, or a PNG of the current frame. Before exporting, the output is re-read with the engine's own parsers as a compatibility check; problems go to the console and you confirm before continuing
 

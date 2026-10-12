@@ -41,8 +41,8 @@ export const LIBRARY_DOC: DocSection[] = [
       {
         k: "p",
         v: {
-          zh: "工作台把播放和编辑放在同一个页面：左边「壁纸库」选壁纸，中间看画面，右边调配置和渲染参数，底部看日志和帧率；同一张壁纸可以直接接着编辑。本地运行 pnpm dev 后打开 http://localhost:1430/ 即可。",
-          en: "The workbench puts playing and editing on one page: pick a wallpaper in the Library tab on the left, watch it in the middle, tune its config and render settings on the right, and read logs and frame rate at the bottom — then keep editing the same wallpaper. Run pnpm dev locally and open http://localhost:1430/.",
+          zh: "工作台把播放和编辑放在同一个页面：左边「壁纸库」选壁纸，中间看画面，右边调壁纸参数，底部看日志和帧率；同一张壁纸可以直接接着编辑。帧率上限、音量与画质档收在视口工具条的「渲染选项」弹出菜单里，是全局偏好。本地运行 pnpm dev 后打开 http://localhost:1430/ 即可。",
+          en: "The workbench puts playing and editing on one page: pick a wallpaper in the Library tab on the left, watch it in the middle, tune its wallpaper properties on the right, and read logs and frame rate at the bottom — then keep editing the same wallpaper. Frame cap, volume and quality tiers live in the \"Render options\" popup on the viewport toolbar and are global preferences. Run pnpm dev locally and open http://localhost:1430/.",
         },
       },
       {
@@ -53,8 +53,8 @@ export const LIBRARY_DOC: DocSection[] = [
         ],
         rows: [
           [{ zh: "壁纸库（左栏标签）", en: "Library (left tab)" }, { zh: "列出壁纸库目录里的条目，可按标题 / itemId 过滤、按 Scene / Web / Video 分类；右键可新窗口播放、在 Finder 中显示或删除。标签栏右侧的文件夹按钮切换壁纸库目录", en: "Lists the items in the library folder; filter by title / itemId and by Scene / Web / Video. Right-click to play in a new window, reveal in Finder or delete. The folder button beside the tabs switches library folders" }],
-          [{ zh: "视口（中）", en: "Viewport (center)" }, { zh: "壁纸画面。视口工具条切宽高比、适配方式与渲染 DPR；场景壁纸还有时间轴。把 .pkg 文件直接拖进视口即可本地打开", en: "The wallpaper itself. Its toolbar switches aspect ratio, fit and render DPR; scene wallpapers also get a timeline. Drop a .pkg file onto the viewport to open it locally" }],
-          [{ zh: "壁纸配置 / 渲染（右栏标签）", en: "Wallpaper config / Render (right tabs)" }, { zh: "「壁纸配置」是作者暴露的用户属性，改动即时生效并写回本机覆盖表；「渲染」是帧率上限、音量、画质档等全局偏好", en: "\"Wallpaper config\" holds the author's user properties — changes apply live and are saved to this machine's overrides; \"Render\" holds global preferences such as fps cap, volume and quality tiers" }],
+          [{ zh: "视口（中）", en: "Viewport (center)" }, { zh: "壁纸画面。视口工具条切宽高比、适配方式与渲染 DPR，最右的「渲染选项」管帧率上限 / 音量 / 抗锯齿 / 粒子 / 后处理；场景壁纸还有时间轴。把 .pkg 文件直接拖进视口即可本地打开", en: "The wallpaper itself. Its toolbar switches aspect ratio, fit and render DPR, and \"Render options\" at its right end holds frame cap / volume / anti-aliasing / particles / post-processing; scene wallpapers also get a timeline. Drop a .pkg file onto the viewport to open it locally" }],
+          [{ zh: "壁纸配置（右栏标签）", en: "Wallpaper config (right tab)" }, { zh: "作者暴露的用户属性都在这里：改动即时生效并写回本机覆盖表（场景壁纸就地热更，网页 / 视频壁纸保存后重新挂载生效）", en: "The author's user properties live here: changes apply live and are written back to this machine's override table (scene wallpapers hot-apply in place; web / video wallpapers take effect after saving and re-mounting)" }],
           [{ zh: "控制台 / 性能（底）", en: "Console / Performance (bottom)" }, { zh: "控制台汇总操作日志与渲染器诊断；性能页画出最近 2 分钟的实测帧率曲线", en: "The console merges action logs with renderer diagnostics; the performance tab plots the measured frame rate over the last 2 minutes" }],
           [{ zh: "主工具条 / 状态栏", en: "Main toolbar / status bar" }, { zh: "工具条居中的是播放 / 暂停与重新加载；状态栏显示当前文档、图层数、分辨率、保存状态与实测帧率", en: "The toolbar centers play / pause and reload; the status bar shows the current document, layer count, resolution, save state and measured fps" }],
         ],
@@ -63,6 +63,7 @@ export const LIBRARY_DOC: DocSection[] = [
         k: "ul",
         items: [
           { zh: "面板可拖动分隔条调整尺寸，双击分隔条收起；工具条最右的「重置布局」恢复默认", en: "Drag the splitters to resize panels and double-click one to collapse; \"Reset layout\" at the right end of the toolbar restores the defaults" },
+          { zh: "视口工具条上的「渲染选项」弹出菜单收着帧率上限、音量、系统实况与抗锯齿 / 粒子 / 后处理：全局偏好，所有壁纸共用、改动即时生效、不写进工程", en: "\"Render options\" on the viewport toolbar collects the frame cap, volume, system live and anti-aliasing / particles / post-processing: global preferences shared by every wallpaper, applied instantly and never written into the project" },
           { zh: "壁纸库与属性读写依赖本地宿主后端（pnpm dev 自带）；后端不可用时壁纸库显示空态，但「打开 .pkg」与拖入仍可用", en: "The library and property storage need the local host backend (bundled with pnpm dev); without it the library shows an empty state, but Open .pkg and drag-and-drop still work" },
         ],
       },
@@ -420,6 +421,28 @@ export const LIBRARY_DOC: DocSection[] = [
     ],
   },
   {
+    id: "lb-system-live",
+    title: { zh: "系统实况：宿主替你接上系统媒体", en: "System live: letting the host wire up system media" },
+    blocks: [
+      {
+        k: "p",
+        v: {
+          zh: "同一份 MediaSource 契约，宿主也可以不走浏览器、直接把系统接进来：工作台与桌面端在系统侧读「正在播放」（歌名 / 歌手 / 进度 / 封面）与系统输出频谱，再按这套契约喂进引擎 —— scene 与 web 壁纸都不用改。因为采集发生在系统侧，既不依赖浏览器的 MediaSession，也不需要麦克风权限。",
+          en: "The same MediaSource contract can be wired straight to the system instead of the browser: the workbench and the desktop app read system \"Now Playing\" (title / artist / progress / cover) and the system output spectrum on the system side, then feed them to the engine through that contract — neither scene nor web wallpapers need any change. Because collection happens on the system side it needs neither the browser MediaSession nor microphone permission.",
+        },
+      },
+      {
+        k: "ul",
+        items: [
+          { zh: "工作台的「系统实况」开关就在视口工具条的「渲染选项」里（与帧率上限 / 音量 / 画质档同一处）：打开后音频反应层与封面层跟着系统声音动，关掉时交回引擎内置媒体源；它是全局偏好，不写进工程", en: "\"System live\" in the workbench sits in \"Render options\" on the viewport toolbar (next to frame cap / volume / quality tiers): turn it on and audio-reactive layers and cover layers move with the system's sound; turn it off and the engine's built-in media source takes over. It is a global preference, not written into the project" },
+          { zh: "播放器不给封面时，宿主按「歌名 + 歌手」去公开曲库在线补一张（免 key，本机磁盘缓存 30 天）；查不到就保持「无封面」，元数据本身照常。设 WE_ONLINE_ARTWORK=0 可关掉在线补图", en: "When the player supplies no cover, the host looks one up online in public catalogs by title + artist (no key needed, cached on disk for 30 days); if nothing matches it simply stays \"no cover\" and the metadata is unaffected. Set WE_ONLINE_ARTWORK=0 to switch the lookup off" },
+          { zh: "引擎只在真的出声时占着系统「正在播放」槽位：暂停、脚本 stop 或把音量调到 0，会主动卸掉音频源、把槽位交还给用户的播放器；恢复播放或调回音量时自动装回并续上暂停前的位置。从未出声过的声音元素不动，壁纸自带播放面板的进度不受影响", en: "The engine only holds the system's \"Now Playing\" slot while it is actually audible: pausing, calling stop() or dropping the volume to 0 unloads the audio sources and hands the slot back to the user's player; resuming or raising the volume puts them back and seeks to where playback had reached. Sound elements that were never audible are left alone, so a wallpaper's own playback panel keeps its position" },
+          { zh: "宿主侧的取数面（自己写宿主时照这几条接）：GET /api/system/media 正在播放、GET /api/system/artwork 当前封面、GET /api/system/stream 媒体 + 频谱的 SSE、POST /api/system/media-control 切歌 / 播放 / 暂停", en: "Host-side endpoints (wire a host of your own against these): GET /api/system/media for now playing, GET /api/system/artwork for the current cover, GET /api/system/stream for an SSE of media + spectrum, and POST /api/system/media-control for skip / play / pause" },
+        ],
+      },
+    ],
+  },
+  {
     id: "inject",
     title: { zh: "注入指针与音频", en: "Injecting pointer & audio" },
     blocks: [
@@ -542,40 +565,32 @@ export const LIBRARY_DOC: DocSection[] = [
       {
         k: "p",
         v: {
-          zh: `当前版本 ${version}（自 2.0.2 起 61 个提交）。这一版主线是「官方内置示例工程全量兼容」「引擎加固」与「松散目录形态」：官方 19 个内置源码工程（defaultprojects）从素模/错色恢复到官方画面，解析器与生命周期补上失控边界，场景壁纸不再需要打包 scene.pkg 也能装载。`,
-          en: `Current version: ${version} — 61 commits since 2.0.2. Three themes: full compatibility with the official built-in sample projects, engine hardening, and the loose-directory form. The 19 built-in source projects (defaultprojects) recover from blank models / wrong colors to official visuals, the parser and the lifecycle gain bounded failure modes, and scene wallpapers no longer need a packed scene.pkg to load.`,
+          zh: `当前版本 ${version}（自 2.1.0 起 104 个提交，不含合并）。这一版面向播放的最大变化是「系统媒体桥」：正在播放与音频频谱改由宿主在系统侧采集（浏览器不再采麦克风，也不依赖 MediaSession），播放器不给封面时会去公开曲库在线补一张；引擎也学会在暂停 / 静音时把系统「正在播放」槽位交还给真正的播放器。其余提交集中在工作台（编辑器）侧。`,
+          en: `Current version: ${version} — 104 commits since 2.1.0, merge commits excluded. The biggest playback-facing change is the system media bridge: Now Playing and the audio spectrum are now collected by the host on the system side (the browser no longer captures the microphone and no longer relies on MediaSession), and when the player supplies no cover the host looks one up online in public catalogs; the engine also learned to hand the system's "Now Playing" slot back to the real player when it pauses or goes silent. The remaining commits are on the workbench (editor) side.`,
         },
       },
       {
         k: "ul",
         items: [
           {
-            zh: "官方内置示例工程全量兼容（F1–F50）：源码工程装载链、模型层走材质 shader + 多槽贴图、场景级相机路径与 usershadervalues 绑定、arsenal 的贴图/材质/光照链、引擎内置 shader 三档识别（工坊包里没有也能挂）、内置 generic shader 的逐像素复刻、粒子材质自带 shader + colorrandom 逐分量随机 —— eagleflag、fantasticcar、shimmering_particles、arsenal、ricepod 等从素模/错色恢复到官方画面。",
-            en: "Full compatibility with the official built-in sample projects (F1–F50): a source-project loading chain, model layers running material shaders with multi-slot textures, scene-level camera paths and usershadervalues bindings, arsenal's texture/material/lighting chain, three-tier built-in shader recognition (mounts even when the package lacks them), a pixel-exact replica of the built-in generic shader, and particle materials with their own shaders plus per-component colorrandom — eagleflag, fantasticcar, shimmering_particles, arsenal and ricepod recover from blank models / wrong colors to official visuals.",
+            zh: "系统媒体桥：正在播放（歌名 / 歌手 / 进度 / 封面）与系统输出频谱改由宿主在系统侧采集后按 MediaSource 契约喂进引擎 —— scene 与 web 壁纸都不用改，浏览器不再采麦克风、也不依赖 MediaSession；工作台的开关是视口工具条「渲染选项」里的「系统实况」。",
+            en: "System media bridge: Now Playing (title / artist / progress / cover) and the system output spectrum are now collected by the host on the system side and fed to the engine through the MediaSource contract — neither scene nor web wallpapers change, and the browser captures no microphone and relies on no MediaSession; the workbench switch is \"System live\" inside \"Render options\" on the viewport toolbar.",
           },
           {
-            zh: "深度与遮挡重做：层间深度持久化并按材质 depthtest/depthwrite 逐网格设置、贴着相机的壳不参与深度、混合 pass 不写深度、真 3D 模型帧内共享深度、透明像素不写深度 + 子网格按材质排序 —— neon_sunset 太阳外围黑方块、3477054430 城市盖住猫/树黑方块、3254178774 模型炸成碎三角不再复现。",
-            en: "Depth & occlusion rework: inter-layer depth is now persistent and set per mesh from material depthtest/depthwrite, camera-adjacent shells are excluded from depth testing, blended passes no longer write depth, true-3D models share depth within the frame, and transparent pixels no longer write depth with sub-meshes sorted by material — the black squares around neon_sunset's sun, 3477054430's city covering the cat / tree black squares, and 3254178774's model exploding into broken triangles no longer reproduce.",
+            zh: "在线封面补图：播放器不给封面时（汽水音乐这类客户端不写 ArtworkData），宿主按「歌名 + 歌手」去公开曲库补一张 —— 歌名是准入条件、歌手只加分（简繁与罗马字写法不一致也算不中），查不到就保持「无封面」；本机磁盘缓存 30 天，WE_ONLINE_ARTWORK=0 关闭。",
+            en: "Online cover lookup: when the player supplies no cover (clients such as Soda Music never write ArtworkData), the host looks one up in public catalogs by title + artist — the title is the admission gate while the artist only adds weight (simplified / traditional / romanized spellings of a name miss each other), and a miss simply keeps \"no cover\"; the on-disk cache lasts 30 days and WE_ONLINE_ARTWORK=0 turns it off.",
           },
           {
-            zh: "引擎加固：素材可控字段的解析闸门（几十字节的畸形 .tex 不再把解析器拖到 OOM）、GL 资源登记表（卸载后资源确定性归零）、上下文丢失从静默冻结变成可见事件、实例终态与代际令牌（destroy 不再复活、多实例的调试面互不误删）、四条静默失败路径接一次性诊断。",
-            en: "Engine hardening: parse gates on attacker-controlled fields (a few dozen malformed bytes in a .tex can no longer drag the parser into OOM), a GL resource registry (teardown deterministically returns resource counts to zero), context loss turns from a silent freeze into a visible event, instance finality & generation tokens (destroy no longer resurrects, and multi-instance debug surfaces no longer delete each other), plus one-shot diagnostics on four previously silent failure paths.",
+            zh: "交还系统「正在播放」槽位：声音层只在真的出声（音量 > 0 且未暂停）时占着系统媒体会话，暂停 / 脚本 stop / 音量归零会把音频源卸掉、交还给用户的播放器，恢复时装回并续上暂停前的位置 —— 修的是「音条正常、封面不出来」（桥把编辑器当成了正在播放的客户端）；从未出声过的声音元素不动，壁纸自带播放面板的进度不受影响。",
+            en: "Handing the system \"Now Playing\" slot back: a sound layer only holds the OS media session while it is actually audible (volume > 0 and not paused); pausing, calling stop() or zeroing the volume unloads the audio sources and hands the session back to the user's player, and resuming reinstalls them at the saved position — this fixes \"meters move, cover never appears\", where the bridge counted the editor as the now-playing client. Sound elements that were never audible are left alone, so a wallpaper's own playback panel keeps its position.",
           },
           {
-            zh: "松散目录形态：project.json 的 file 以 .json 结尾即按源码工程装载（materials/、models/、shaders/ 等按名取文件），无需打包 scene.pkg；预览/调试页可加 ?form=pkg 或 ?form=loose 强制单臂做 A/B。",
-            en: "Loose-directory form: a project.json whose file ends with .json loads as a source project (materials/, models/, shaders/ etc. fetched by name) — no scene.pkg packing needed; the bench/debug pages accept ?form=pkg or ?form=loose to force one arm for an A/B.",
+            zh: "网页壁纸工程的相对资源：宿主按作者源码目录解析 type:\"web\" 工程的相对资源（web-manifest / web-resolve），保存链路改用 ?we-raw=1 读元字节 —— 不再把运行时注入的结果写回作者文件（真实库里同一个 index.html：注入态 69910 字节，原文件 6906 字节）。",
+            en: "Relative assets of web wallpapers: the host resolves relative assets of a type:\"web\" project against the author's source directory (web-manifest / web-resolve), and the save path now reads raw bytes via ?we-raw=1 — so runtime-injected markup is no longer written back into the author's files (in a real library entry the same index.html was 69910 bytes injected versus 6906 bytes on disk).",
           },
           {
-            zh: "交互与文字：命中门槛改为祖先可见性 —— 隐形 Solid 点击区（3810092560 点击互动）照常可点；anchor:none 按文字对齐贴 origin，修 3509578940 文字时钟被剪贴蒙版抹掉，以及 3694771168 周几盒偏移与时钟黑字。",
-            en: "Interaction & text: the hit-test gate now walks ancestor visibility — invisible Solid click zones (3810092560's click interaction) still receive clicks; anchor:none hugs origin by text alignment, fixing 3509578940's text clock being wiped by a clipping mask, plus 3694771168's weekday-box offset and black clock digits.",
-          },
-          {
-            zh: "Web 壁纸与宿主控制：相对 URL 逃出站点根时按官方语义夹回根（3650874083/3650880224 Blue Archive spine 整页黑屏）、站点根夹住支持宿主声明、__wp.setMediaControl 控制反转 + 媒体按钮点击推断（3794460976 音乐控制接入）、applyUserProperties 按官方字母序下发（corsair_collection 白屏）。",
-            en: "Web wallpapers & host control: relative URLs escaping the site root are clamped back per official semantics (3650874083/3650880224 Blue Archive spine full-page blackout), the site-root clamp supports host declarations, __wp.setMediaControl lands control inversion plus media-button click inference (3794460976 music control), and applyUserProperties is sent in the official alphabetical order (corsair_collection blank screen).",
-          },
-          {
-            zh: "性能与内部收敛：粒子三线性插值的单元格角点缓存 —— 重粒子场景稳态 fps 25.6 → 29.5（+15.2%）；mulberry32 / parsePkg / linkProgram / mat4Mul 各四份拷贝分别收敛为一份。",
-            en: "Performance & internal convergence: per-cell corner caching for particle trilinear interpolation — steady-state fps on heavy-particle scenes went 25.6 → 29.5 (+15.2%); four copies each of mulberry32 / parsePkg / linkProgram / mat4Mul converge into one.",
+            zh: "播放侧模型修复：2D 场景里导入的模型恢复深度自遮挡与默认主光；mdl 眨眼补偿不再把闭眼该留下的睫毛当「被盖件」删掉，眼皮盖住的虹膜 / 眼球跟着收，侧脸角色的眼球遮挡判据从「谁更大」换成当前帧就地交叠（3671936032 人物与希罗）。",
+            en: "Playback-side model fixes: models imported into a 2D scene regain depth self-occlusion and a default key light; mdl blink compensation no longer deletes the eyelashes a closed eye should keep as \"covered parts\", the iris / eyeball under a lowered eyelid retracts too, and for a side-on character the occlusion test changed from \"which is bigger\" to same-frame overlap (the 3671936032 character and 希罗).",
           },
         ],
       },
