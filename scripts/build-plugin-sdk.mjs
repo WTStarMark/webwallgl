@@ -16,11 +16,28 @@ import { execFileSync } from "node:child_process";
 import fs from "node:fs";
 import path from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
+import { glslModule, minifyGlsl, normalizeTail, isPrefixBlock, withHeaderComments } from "./lib/glsl-plugin.mjs";
 
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const SDK_ENTRY = path.join(ROOT, "editor/sdk/index.ts");
 const EXAMPLES = path.join(ROOT, "examples/plugins");
 const BANNER = "// 由 scripts/build-plugin-sdk.mjs 从 src/index.ts 生成，勿手改。\n";
+
+/** .glsl → 单文件 ESM 文本模块（issue #14：第三方插件的 shader 片段也走独立 .glsl） */
+const glslLoader = {
+  name: "wwgl-glsl",
+  setup(b) {
+    b.onLoad({ filter: /\.glsl$/ }, (a) => ({
+      contents: (() => {
+        const raw = fs.readFileSync(a.path, "utf8");
+        let code = minifyGlsl(raw);
+        if (isPrefixBlock(a.path) && a.path.endsWith(".head.glsl")) code = withHeaderComments(code, raw);
+        return glslModule(normalizeTail(code, isPrefixBlock(a.path)));
+      })(),
+      loader: "js",
+    }));
+  },
+};
 
 const guard = {
   name: "wwgl-plugin-guard",
@@ -54,7 +71,7 @@ export async function buildPluginCode(dir) {
     target: "es2022",
     charset: "utf8",
     legalComments: "none",
-    plugins: [guard],
+    plugins: [glslLoader, guard],
     logLevel: "silent",
   });
   return BANNER + out.outputFiles[0].text;

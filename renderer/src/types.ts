@@ -115,15 +115,19 @@ export type WallpaperConfig = {
   /**
    * 网页壁纸 iframe 的沙箱级别。
    *
-   * - 省略 / `"legacy"`：`allow-scripts allow-same-origin` —— WallpaperEM
-   *   壁纸窗口的既有行为（iframe 与渲染页同源，且那个 origin 就是壁纸窗口自己
-   *   的，第三方脚本拿到它无害）。
-   * - `"strict"`：仅 `allow-scripts`（去掉 allow-same-origin）—— 宿主把工坊
-   *   网页壁纸嵌进**共享自身 origin** 的页面时必须用它（例如浏览器插件把壁纸
-   *   挂进主界面）：否则作者脚本能以宿主身份调用宿主 API、读写宿主存储。代价是
-   *   iframe 内 origin 变 opaque —— 作者脚本的 fetch/XHR 需要宿主返回 CORS 头
-   *   （img/script/css 等子资源加载不受影响），父页控制改走 shim 的 postMessage
-   *   通道（见 web.ts 的 weShimSend 与 web-shim.js 末尾）。
+   * - 省略（缺省）：仅 `allow-scripts`（等同于 `"strict"`）—— 见下面 strict 的理由。
+   *   库/宿主不传时即走这一档，因为调用方分不清「独立壁纸窗口」还是「嵌进宿主主界面」，
+   *   而后者下 allow-same-origin 等于把宿主身份交给任意工坊脚本。
+   * - `"strict"`：仅 `allow-scripts`（去掉 allow-same-origin）—— 宿主把工坊网页壁纸
+   *   嵌进**共享自身 origin** 的页面时必须用它（例如浏览器插件把壁纸挂进主界面）：
+   *   否则作者脚本能以宿主身份调用宿主 API、读写宿主存储。代价是 iframe 内 origin 变
+   *   opaque —— 作者脚本的 fetch/XHR 需要宿主返回 CORS 头（img/script/css 等子资源
+   *   加载不受影响），父页控制改走 shim 的 postMessage 通道（见 web.ts 的 weShimSend
+   *   与 web-shim.js 末尾）。
+   * - `"legacy"`：`allow-scripts allow-same-origin` —— WallpaperEM 壁纸窗口的**旧行为**
+   *   （iframe 与渲染页同源，且那个 origin 就是壁纸窗口自己的）。素材依赖宿主身份读
+   *   localStorage / 同源 fetch 时，嵌入方须**显式**声明它才能回到这一档（逃生门）；
+   *   壁纸窗口用 `?webSandbox=legacy` 打开同理。
    */
   webSandbox?: "legacy" | "strict";
   /**

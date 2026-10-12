@@ -155,6 +155,12 @@ rt.fallbackPage = () => mountDefaultWallpaper(rt);
 // 原生控制接口
 declare global {
   interface Window {
+    /**
+     * 宿主控制面。**注意档位**：显式 `webSandbox: "strict"` 的嵌入形态下不挂宿主能力
+     * （setWallpaper / capture / setAudioBridge 被摘除）—— 分档表是紧随本文件
+     * `window.__wp` 赋值之后的 RENDER_PAGE_WP / HOST_ONLY_WP，判定点是 `initialCfg`
+     * 之后的摘除块。
+     */
     __wp?: {
       setWallpaper(cfg: WallpaperConfig): void;
       pause(): void;
@@ -555,6 +561,58 @@ window.__wp = {
   },
 };
 
+/**
+ * `window.__wp` 的两个档位表（最小权限 / M7 方案 B）。
+ *
+ * 渲染页形态（原生壁纸窗口、测试台、编辑器预览）要的是完整控制面；**嵌入形态**（宿主把
+ * 工坊网页壁纸嵌进共享自身 origin 的页面，即显式 `webSandbox: "strict"`）下页面按不可信
+ * 内容处理 —— 逃出脚本沙箱的工坊脚本只该能控制「这一页怎么渲染」，不该拿到宿主能力。
+ * 分档依据落在这两张表上（而不是散在代码里）：scripts/verify-arch.mjs 要求 `__wp` 的每个
+ * 方法**恰好属于其中一张**（新加方法忘了分档即红），并要求 strict 形态下摘掉 HOST_ONLY_WP。
+ *
+ * 判据是**显式** `webSandbox === "strict"`，不是默认档规则（web.ts::webSandboxIsStrict 的
+ * 「非 legacy 即 strict」）：原生壁纸窗口**不带** `webSandbox` 参数，它的整条宿主控制协议
+ * 就是这个 `__wp`（换壁纸 / 抓帧 / 音频桥都在里面），缺省必须逐位保持全表面。详见
+ * docs/COMPLIANCE.md §四。
+ */
+export const RENDER_PAGE_WP = [
+  // 渲染与交互控制（都是「静默失效类契约」：宿主按名调用，缺失只表现为壁纸不响应，没有报错）
+  "pause",
+  "resume",
+  "setFit",
+  "setVolume",
+  "release",
+  "restore",
+  "setRenderDpr",
+  "setSceneFps",
+  "setQuality",
+  "getQuality",
+  "setFilter",
+  "updateWebProps",
+  // 外部指针 / 滚轮注入（桌面 underlay 层收不到鼠标事件，宿主轮询系统鼠标后推入）
+  "pushPointer",
+  "pointerLeave",
+  "pushWheel",
+  // 媒体集成：显示数据（setMedia）与控制面（setMediaControl，控制反转的注入点）
+  "setMedia",
+  "setMediaControl",
+  // 场景装载 / 用户属性 / 遮挡与状态查询
+  "loadSceneFile",
+  "getProperties",
+  "setOcclusion",
+  "getOcclusion",
+  "getState",
+] as const;
+
+/**
+ * 宿主能力：换壁纸、抓帧、注入音频桥 —— 正是 docs/ENGINE-REVIEW-2026-10.md §2.1 里
+ * 「逃出脚本沙箱的工坊脚本能拿到什么」那三条。strict 形态下从 `window.__wp` 上摘掉。
+ *
+ * 这不等于隔离：脚本沙箱自身的逃逸向量（Function 构造器 / eval 间接调用等）未修，
+ * 见 docs/COMPLIANCE.md §四与 scripts/verify-sandbox.mjs 头部。
+ */
+export const HOST_ONLY_WP = ["setWallpaper", "capture", "setAudioBridge"] as const;
+
 // 初始配置优先取自 URL query（壁纸引擎窗口创建时注入，同步无竞态）。
 // 旧形态没有 source 字段 —— mediaBase/src 由 scene-mount 内部合成 httpSource。
 const params = new URLSearchParams(location.search);
@@ -578,9 +636,15 @@ const initialCfg: WallpaperConfig = {
   bake: params.get("bake") === "0" ? false : undefined,
   liveSystem: params.get("liveSystem") === "1" || params.get("liveSystem") === "true",
   opaque: params.get("opaque") === "1" || params.get("opaque") === "true",
-  // 严格沙箱（网页壁纸）：宿主与壁纸共享 origin 时置 "strict"，
-  // iframe 只给 allow-scripts（详见 types.ts 的 webSandbox 注释）。
-  webSandbox: params.get("webSandbox") === "strict" ? "strict" : undefined,
+  // 网页壁纸沙箱档（三态）：
+  //   缺省（不带参数）= 收紧档 strict（见 types.ts 的 webSandbox 注释）；
+  //   `?webSandbox=strict` 显式收紧（默认值，幂等）；
+  //   `?webSandbox=legacy` 显式回到旧的 allow-scripts allow-same-origin —— 给嵌入方的
+  //   逃生门（工坊素材依赖宿主身份读 localStorage / 同源 fetch 时）。
+  webSandbox: (() => {
+    const s = params.get("webSandbox");
+    return s === "strict" || s === "legacy" ? s : undefined;
+  })(),
   clearColor: params.get("clearColor") ?? undefined,
   // 场景形态强制开关（调试 / A-B 用）：`?form=pkg` 强制 scene.pkg、`?form=loose`
   // 强制松散目录（取不到入口即报错、不静默回退 —— 否则 A/B 双臂会变成同一条路）。
@@ -592,6 +656,11 @@ const initialCfg: WallpaperConfig = {
   // 性能设置（aa/pq/pp）：测试台工具条与宿主的抗锯齿/粒子/后处理档位
   quality: qualityFromQuery((k) => params.get(k)),
 };
+// 最小权限（方案 B）：只有显式声明 strict 的嵌入形态摘掉宿主能力；缺省与 legacy 逐位不变。
+// 摘除必须在 cfg 就绪之后（否则 strict 判据取不到），且晚于 `window.__wp` 的赋值。
+if (initialCfg.webSandbox === "strict" && window.__wp) {
+  for (const k of HOST_ONLY_WP) delete (window.__wp as unknown as Record<string, unknown>)[k];
+}
 rt.cfg = initialCfg;
 applyWallpaperFilter(rt);
 mountWallpaper(rt, initialCfg);

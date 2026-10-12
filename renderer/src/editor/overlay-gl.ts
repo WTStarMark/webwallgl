@@ -17,21 +17,13 @@
 //      （只记录调用）就能断言「着色器只编一次 + 空数组不 draw + 线段数正确 +
 //      状态被原样还原」。
 
-const VERT = `#version 300 es
-in vec2 aPos;
-uniform vec2 uViewport;
-uniform float uDepth;
-void main() {
-  float x = (aPos.x / uViewport.x) * 2.0 - 1.0;
-  float y = 1.0 - (aPos.y / uViewport.y) * 2.0;
-  gl_Position = vec4(x, y, uDepth, 1.0);
-}`;
+import VERT_RAW from "./shaders/overlay.vert.glsl";
+import FRAG_RAW from "./shaders/overlay.frag.glsl";
 
-const FRAG = `#version 300 es
-precision mediump float;
-uniform vec4 uColor;
-out vec4 outColor;
-void main() { outColor = uColor; }`;
+// GLSL 独立成 .glsl 文件（issue #14）：高亮 / 维护友好，打包时剥注释/空行。
+// 注意末尾换行：旧内联模板串没有末尾换行，导入后归一（编译器不敏感，但断言对拍要一致）。
+const VERT = VERT_RAW.replace(/\n+$/, "");
+const FRAG = FRAG_RAW.replace(/\n+$/, "");
 
 export type OverlayViewport = { width: number; height: number };
 

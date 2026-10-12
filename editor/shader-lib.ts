@@ -5,6 +5,19 @@
 
 import { createRegistry } from "./core";
 
+// 内置 shader 片段独立成 .glsl 文件（issue #14）：高亮 / 维护友好，打包时剥注释/空行
+// （expandShader 的 include 语义不变，`#include "wwgl/<名>"` 仍在 .glsl 里写）。
+import HASH_SRC from "./shaders/snippets/hash.glsl";
+import NOISE_SRC from "./shaders/snippets/noise.glsl";
+import COLOR_SRC from "./shaders/snippets/color.glsl";
+
+
+/**
+ * .glsl 模块文本归一：文件末尾换行去掉，保持与旧内联模板逐字节一致
+ * （expandShader 的产物写进 WE 工程，不能多个/少个换行）。
+ */
+const nl = (s: string) => s.replace(/\n+$/, "");
+
 export type ShaderSnippet = {
   /** include 名，形如 wwgl/noise（不带引号） */
   id: string;
@@ -43,58 +56,17 @@ export const BUILTIN_SNIPPETS: ShaderSnippet[] = [
   {
     id: "wwgl/hash",
     description: "hash12 / hash22：确定性伪随机",
-    code: `float wwglHash12(vec2 p) {
-	vec3 p3 = fract(vec3(p.x, p.y, p.x) * 0.1031);
-	p3 += dot(p3, p3.yzx + 33.33);
-	return fract((p3.x + p3.y) * p3.z);
-}
-vec2 wwglHash22(vec2 p) {
-	vec3 p3 = fract(vec3(p.x, p.y, p.x) * vec3(0.1031, 0.1030, 0.0973));
-	p3 += dot(p3, p3.yzx + 33.33);
-	return fract((p3.xx + p3.yz) * p3.zy);
-}`,
+    code: nl(HASH_SRC),
   },
   {
     id: "wwgl/noise",
     description: "wwglNoise(vec2)：值噪声；wwglFbm(vec2)：4 层分形",
-    code: `#include "wwgl/hash"
-float wwglNoise(vec2 p) {
-	vec2 i = floor(p);
-	vec2 f = fract(p);
-	vec2 u = f * f * (3.0 - 2.0 * f);
-	return mix(mix(wwglHash12(i), wwglHash12(i + vec2(1.0, 0.0)), u.x),
-	           mix(wwglHash12(i + vec2(0.0, 1.0)), wwglHash12(i + vec2(1.0, 1.0)), u.x), u.y);
-}
-float wwglFbm(vec2 p) {
-	float v = 0.0;
-	float a = 0.5;
-	for (int i = 0; i < 4; i++) {
-		v += a * wwglNoise(p);
-		p *= 2.0;
-		a *= 0.5;
-	}
-	return v;
-}`,
+    code: nl(NOISE_SRC),
   },
   {
     id: "wwgl/color",
     description: "rgb2hsv / hsv2rgb / 亮度",
-    code: `vec3 wwglRgb2Hsv(vec3 c) {
-	vec4 K = vec4(0.0, -1.0 / 3.0, 2.0 / 3.0, -1.0);
-	vec4 p = mix(vec4(c.bg, K.wz), vec4(c.gb, K.xy), step(c.b, c.g));
-	vec4 q = mix(vec4(p.xyw, c.r), vec4(c.r, p.yzx), step(p.x, c.r));
-	float d = q.x - min(q.w, q.y);
-	float e = 1.0e-10;
-	return vec3(abs(q.z + (q.w - q.y) / (6.0 * d + e)), d / (q.x + e), q.x);
-}
-vec3 wwglHsv2Rgb(vec3 c) {
-	vec4 K = vec4(1.0, 2.0 / 3.0, 1.0 / 3.0, 3.0);
-	vec3 p = abs(fract(c.xxx + K.xyz) * 6.0 - K.www);
-	return c.z * mix(K.xxx, clamp(p - K.xxx, 0.0, 1.0), c.y);
-}
-float wwglLuma(vec3 c) {
-	return dot(c, vec3(0.299, 0.587, 0.114));
-}`,
+    code: nl(COLOR_SRC),
   },
 ];
 

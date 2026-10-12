@@ -4,13 +4,52 @@
  */
 
 /**
- * shim 已在 HTML 里的判据：按属性**存在性**判断，不看值。
- * 早期这里写死 `data-we-shim="1"`（本文件自己的注入值），宿主自己注入时用的是
- * `data-we-shim="host"` —— 匹配不上就会再注一遍，同一文档两套 shim，rAF 节流、
- * 指针桥、音频泵全部叠加（实测 15fps 上限被限两次 → 7.5fps，用户观感「卡得不行」）。
+ * shim 已在 HTML 里的判据：必须是**真正的 `<script …>` 元素**（开标签带属性 + 闭合标签），
+ * 不是「整篇文档里出现过这个属性名」。
+ *
+ * 为什么不能用存在性匹配：属性名是**素材可控字符串** —— 注释、`<meta content>`、无关标签的
+ * 属性、内联 JSON，甚至作者脚本正文里的一句 `document.querySelector('[data-we-shim]')`
+ * 都会命中，命中即**不注入**。注入失败是静默的：shim 是 rAF 节流、指针桥、音频泵、种子
+ * 脚本的载体，少了它只是「帧率不设限、指针/音频不响应」，宿主侧没有任何报错。
+ * 旧写法（`/\bdata-we-shim(?:-src)?\b/i`）实测三类合成样本全部被短路，见
+ * scripts/verify-sandbox.mjs 的 §三（那三条样本现在是必须注入的红线）。
+ *
+ * 值仍不看：宿主自己注入时用 `data-we-shim="host"`，本文件自己的是 `data-we-shim-src` ——
+ * 只看「有没有一套已经装好的 shim」。早期这里写死 `data-we-shim="1"`（本文件自己的注入值），
+ * 宿主注 `host` 时匹配不上就会再注一遍，同一文档两套 shim，rAF 节流、指针桥、音频泵全部
+ * 叠加（实测 15fps 上限被限两次 → 7.5fps，用户观感「卡得不行」）。
+ *
+ * 已知边界（记在 docs/COMPLIANCE.md §四）：素材仍可显式写一个带该属性的 `<script>` 元素来
+ * 拒绝注入 —— 而那正是 dsh-wallpaper-engine 的 `/scene-files` 互操作契约本身（宿主注
+ * `data-we-shim="host"`），要取消它得先改宿主契约与 scripts/verify-web.mjs 的宿主用例。
+ * 「作者自己的无关脚本恰好带 `data-we-shim-src="1"`」是**同一枚硬币的另一面**：属性在场即
+ * 声明「已有 shim」，刻意保留，不改行为（见 scripts/verify-web.mjs 的 host 侧同构判据）。
+ *
+ * **注释不算在场**：判重前必须先把 HTML 注释剥掉（见 blankHtmlComments）—— 注释内容浏览器
+ * 不解析，作者把标记写进注释同样能让注入静默消失。
  */
-const SHIM_MARK_RE = /\bdata-we-shim(?:-src)?\b/i;
+const SHIM_TAG_RE = /<script\b[^>]*\bdata-we-shim(?:-src)?\b[^>]*>[\s\S]*?<\/script\s*>/i;
 const SHIM_ATTR = "data-we-shim-src";
+
+/**
+ * 判重与选点专用：把 HTML 注释整段**置空**（用等长空格，索引仍与原串一一对应，切片一律用原串）。
+ *
+ * 为什么判重前必须剥注释：注释内容浏览器**不解析、不执行**，但 shim 标记是素材可控字符串 ——
+ * 作者只要写 `<!-- <script data-we-shim-src="1"></script> -->`，`SHIM_TAG_RE` 就会命中，
+ * 于是我们**不注入**：rAF 节流、指针桥、音频泵、种子脚本全丢，宿主侧没有任何诊断
+ * （M7 §2.3 第 4 条「注入不可被素材短路」正是要禁掉这个形态）。
+ *
+ * 选点也用同一张视图：注释里的 `<head>` / `<script>` 不是真锚点 —— 把 shim 注进注释区间会被
+ * 浏览器一起吞掉；注释里的 `<script>` 还会把插入点提到 `<!doctype>` 之前，触发怪异模式。
+ *
+ * 未闭合注释按「吞到文档末尾」处理（`(?:-->|$)`，与浏览器解析一致）；`<!--[if IE]>…<![endif]-->`
+ * 条件注释整段置空（现代引擎本来就不执行其中的脚本）。
+ *
+ * 与 host/we-web-html.mjs 的同名函数**逐条同构**（host/ 不得跨层 import，只能镜像）。
+ */
+function blankHtmlComments(html: string): string {
+  return html.replace(/<!--[\s\S]*?(?:-->|$)/g, (m) => " ".repeat(m.length));
+}
 
 /** 作者自带的 <base> 标签（改写判断用）。 */
 const BASE_TAG_RE = /<base\b[^>]*>/gi;
@@ -99,7 +138,8 @@ export function rewriteHtml(
 ): string {
   if (!html) html = "";
   let out = html;
-  const injected = SHIM_MARK_RE.test(out);
+  // 注释置空视图：判重只看真实存在的 shim 元素（注释里的标记不算在场）。
+  const injected = SHIM_TAG_RE.test(blankHtmlComments(out));
 
   // <base>：跨源入口经 blob URL 挂载，blob 没有目录概念，相对路径全靠它解析。
   // 作者自带的 base 分两类（实测，2026-09-25）：
@@ -138,15 +178,29 @@ export function rewriteHtml(
   const inject = `${base}${script}${seed}`;
   if (!inject) return out;
 
-  // 优先插进 <head> 最前（任何作者 script 之前）
-  const headOpen = /<head(\s[^>]*)?>/i.exec(out);
+  // 优先插进 <head> 最前（任何作者 script 之前）。
+  //
+  // 但**作者可以在 <head> 之前放脚本**（`<!doctype html><script>…</script><html><head>`）：
+  // 解析器会把它提前进 head、排在 head 内容之前 ⇒ 它能先跑并把 `window.__weShimInstalled`
+  // 置上，我们的 shim 进来就整体 `return`（等于没注入，静默）。所以插入点取
+  // 「<head> 开标签之后」与「第一个 <script 之前」中**更早**的那个。
+  //
+  // 锚点也在注释置空视图上找：注释里的 <head>/<script> 不是真锚点（注进注释区间会被吞掉，
+  // 注到 `<!doctype>` 之前会触发怪异模式）。锚点命中串来自视图、切片仍用原串 —— 视图与原串
+  // 等长，索引与长度都一一对应（base 改写可能改过长度，所以在改完之后重算视图）。
+  const anchors = blankHtmlComments(out);
+  const headOpen = /<head(\s[^>]*)?>/i.exec(anchors);
+  const firstScript = /<script\b/i.exec(anchors);
+  if (headOpen && firstScript && firstScript.index < headOpen.index) {
+    return out.slice(0, firstScript.index) + inject + out.slice(firstScript.index);
+  }
   if (headOpen) {
     const at = headOpen.index + headOpen[0].length;
     return out.slice(0, at) + inject + out.slice(at);
   }
 
   // 无 head：在 <html> 后造一个 head
-  const htmlOpen = /<html(\s[^>]*)?>/i.exec(out);
+  const htmlOpen = /<html(\s[^>]*)?>/i.exec(anchors);
   if (htmlOpen) {
     const at = htmlOpen.index + htmlOpen[0].length;
     return out.slice(0, at) + `<head>${inject}</head>` + out.slice(at);

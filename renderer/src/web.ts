@@ -41,6 +41,31 @@ function seedFpsOf(rt: Runtime): number {
 }
 
 /**
+ * 网页壁纸沙箱档（M7 / ENGINE-REVIEW §2.1 方案 C）：**默认 strict**。
+ *
+ * strict = 只给 `allow-scripts`（文档变不透明源）：壁纸文档拿不到宿主 origin ——
+ * 读不了宿主 localStorage/IndexedDB、碰不到父页 DOM、也不能以宿主身份 fetch。
+ * 代价是作者脚本的 fetch/XHR 需要宿主返回 CORS 头（img/script/css/媒体不受影响），
+ * 控制改走 postMessage 通道（见 weShimSend）。只有显式 `webSandbox: "legacy"`
+ * 才回到 `allow-scripts allow-same-origin`（WallpaperEM 壁纸窗口的既有形态）。
+ *
+ * 为什么默认收紧：`undefined` 分不出「宿主是独立的壁纸窗口」还是「宿主把工坊 HTML
+ * 嵌进自己的主界面」，而后者下 allow-same-origin 等于把宿主身份交给任意工坊脚本
+ *（ENGINE-REVIEW §2.3-3）。要旧行为的嵌入方显式声明 legacy。
+ */
+function webSandboxIsStrict(cfg: WallpaperConfig): boolean {
+  return cfg.webSandbox !== "legacy";
+}
+
+/**
+ * 网页壁纸存活判定：宿主主动探针（web.ts → shim "ping" → "we-pong"），见 attachIframe。
+ * 页面的 `we-frame` 是**自报遥测**，宿主不拿它判活。
+ */
+const WEB_LIVENESS_PROBE_MS = 250;
+/** 探针超时：曾应答过探针的页面超过这个时长没回 pong = 主线程可能卡死（只报一次 warn） */
+const WEB_LIVENESS_TIMEOUT_MS = 1200;
+
+/**
  * 网页壁纸控制下发：同源直访优先（WallpaperEM 路径，行为零变化），跨源 /
  * 严格沙箱下自动退回 postMessage。
  *
@@ -658,11 +683,11 @@ function attachIframe(
     blobUrl?: string;
     injected: boolean;
     frameClock?: { last: number };
-    /** 严格沙箱：只给 allow-scripts（去掉 allow-same-origin）。宿主与壁纸共享
-     *  origin 时（插件把工坊 HTML 挂进主界面）必须开启 —— 否则第三方脚本可冒用
-     *  宿主身份；代价是 iframe 内 origin 变 opaque，作者脚本的 fetch/XHR 需要
-     *  宿主返回 CORS 头（img/script/css 不受影响），控制经 weShimSend 的
-     *  postMessage 通道下发。默认 false = WallpaperEM 既有行为。 */
+    /** 严格沙箱：只给 allow-scripts（去掉 allow-same-origin）—— 见
+     *  webSandboxIsStrict，**默认档就是它**（只有显式 legacy 才为 false）。
+     *  文档变不透明源后：作者脚本的 fetch/XHR 需要宿主返回 CORS 头（img/script/css
+     *  不受影响），控制经 weShimSend 的 postMessage 通道下发，露底自适配
+     *  （installLetterboxFix）读不到 contentDocument 而自动降级为满视口。 */
     strictSandbox?: boolean;
   },
 ) {
@@ -674,6 +699,11 @@ function attachIframe(
   // 跨源桥判定 + 就绪状态记录：宿主心跳读它（__wp.getState）。网页壁纸很多没有
   // rAF 帧打点（setTimeout 主循环/纯静态），「iframe 已 load」才是可靠的就绪信号。
   (rt as any).webBridge = opts.strictSandbox ? "post" : "direct";
+  // 存活探针状态（见 WEB_LIVENESS_PROBE_MS）：pongs > 0 = shim 真的应答过，
+  // 之后判活只认探针；pongs === 0 = 没装 shim（裸 iframe / 作者把注入短路了），
+  // 由音频泵的兜底打点保证 frameStats 仍如实反映「宿主还在跑」。
+  const live = { probes: 0, pongs: 0, lastPong: 0, warned: false };
+  (rt as any).webLiveness = live;
   (rt as any).webState = { loaded: false, error: null };
   f.addEventListener("load", () => {
     (rt as any).webState = { loaded: true, error: null };
@@ -700,16 +730,51 @@ function attachIframe(
   const onFrameMsg = (ev: MessageEvent) => {
     if (ev.source !== f.contentWindow) return;
     const data = ev.data;
-    if (!data || data.op !== "we-frame") return;
+    if (!data) return;
+    // ① 宿主探针的应答：**只有这一条**能推宿主帧率计（= 判活依据）。
+    if (data.op === "we-pong") {
+      const recv = performance.now();
+      live.pongs++;
+      live.lastPong = recv;
+      live.warned = false;
+      if (!rt.paused) markFrame(rt, recv);
+      return;
+    }
+    // ② 页面自报的 we-frame：**只作遥测**（webFrameMeter → getState().webFps），
+    // 不进 rt.frameMeter —— 否则作者脚本 `parent.postMessage({op:"we-frame"})`
+    // 就能把看门狗和自适应降档（quality.ts 读 frameMeter.fps）一起骗过去
+    //（ENGINE-REVIEW §2.3-2）。时间戳也只用宿主收报时刻，不采信页面自报的 t
+    //（未来时间戳会把 1s 滑窗算歪）。
+    if (data.op !== "we-frame") return;
     if (rt.paused) return;
-    const t = typeof data.t === "number" ? data.t : performance.now();
-    if (opts.frameClock) opts.frameClock.last = t;
-    markFrame(rt, t);
-    markWebFrame(rt, t);
+    const recv = performance.now();
+    if (opts.frameClock) opts.frameClock.last = recv;
+    markWebFrame(rt, recv);
   };
   window.addEventListener("message", onFrameMsg);
+  // 存活探针：宿主每 WEB_LIVENESS_PROBE_MS 问一次。必须用 postToShim ——
+  // weShimSend 的直访 switch 没有 ping 这一档，而跨源 / 严格沙箱下本来也只有
+  // postMessage 走得通（shim 侧 listener 会校验发送方是父页）。
+  let probeTimer = 0;
+  if (opts.injected) {
+    probeTimer = window.setInterval(() => {
+      if (!rt.iframe || rt.paused) return;
+      live.probes++;
+      postToShim(rt, "ping", { t: performance.now() });
+      // 超时只报一次；从未应答过的不报（那是「没装 shim」，不是「卡死」）。
+      if (
+        live.pongs > 0 &&
+        !live.warned &&
+        performance.now() - live.lastPong > WEB_LIVENESS_TIMEOUT_MS
+      ) {
+        live.warned = true;
+        reportDiag(rt, cfg, "网页壁纸心跳丢失：宿主探针 1.2s 无应答，页面主线程可能卡死", "warn");
+      }
+    }, WEB_LIVENESS_PROBE_MS);
+  }
   const prevCleanup = rt.sceneCleanup;
   rt.sceneCleanup = () => {
+    if (probeTimer) window.clearInterval(probeTimer);
     window.removeEventListener("message", onFrameMsg);
     try {
       prevCleanup?.();
@@ -992,8 +1057,13 @@ function startAudioPump(
       const snap = cur.snapshot();
       const arr = packWebAudioArrayInto(pumpBuffer, snap.left, snap.right);
       pushWebAudio(rt, arr);
-      // 作者用 setTimeout 主循环时 shim 收不到 rAF we-frame（1748506393 FPS 为 `-`）
-      if (frameClock && now - frameClock.last > 200) markFrame(rt, now);
+      // 帧率兜底打点（1748506393 用 setTimeout 主循环，shim 的 rAF we-frame 收不到，
+      // FPS 显示为 `-`）。C2 追加「shim 从未应答探针」条件：装了 shim 时判活只认
+      // 宿主探针（pong），免得伪造的 we-frame 把 frameMeter 刷活、让自适应降档
+      // 永不触发；没装 shim（裸 iframe / 作者短路了注入）时探针永远无声，只能靠
+      // 这里兜底，保证 frameStats 仍如实报「宿主还在跑」。
+      const live = (rt as unknown as { webLiveness?: { pongs: number } }).webLiveness;
+      if (frameClock && now - frameClock.last > 200 && !live?.pongs) markFrame(rt, now);
     } catch {
       /* 忽略单帧失败 */
     }
@@ -1102,6 +1172,10 @@ function installWebCtl(rt: Runtime) {
  * 混在一起时读数永远等于显示刷新率，判断不了壁纸有没有掉帧 —— 排查「限了 30 还是
  * 卡」正需要这个数，所以另立一个 1s 滑窗（跨源/沙箱下渲染页读不到壁纸内部，这是
  * 唯一能反映壁纸真实帧率的信号）。`getState().webFps` 暴露给宿主。
+ *
+ * **信任边界**：we-frame 由壁纸页面自己发出，作者脚本可以随便伪造（甚至报未来
+ * 时间戳）。所以它只进这一个显示用滑窗，**不**进 `rt.frameMeter`（判活/自适应降档
+ * 读的是那个）—— 见 attachIframe 的 onFrameMsg 与 docs/COMPLIANCE.md §四。
  */
 function markWebFrame(rt: Runtime, now: number) {
   const holder = rt as unknown as { webFrameMeter?: { stamps: number[]; fps: number } };
@@ -1223,7 +1297,7 @@ export function mountWeb(rt: Runtime, cfg: WallpaperConfig) {
 
   const finishBare = (why: string) => {
     reportDiag(rt, cfg, `网页壁纸 shim 注入失败（${why}），退回裸 iframe`, "warn");
-    attachIframe(rt, cfg, container, entry, { injected: false, strictSandbox: cfg.webSandbox === "strict" });
+    attachIframe(rt, cfg, container, entry, { injected: false, strictSandbox: webSandboxIsStrict(cfg) });
     startAudioPump(rt, null);
     startMediaPump(rt, null);
     // 裸 iframe 下两个泵都不启、shim 的 we-frame 打点也没有，帧率计从此没有
@@ -1305,7 +1379,7 @@ export function mountWeb(rt: Runtime, cfg: WallpaperConfig) {
     rt.liveUserProps = Object.fromEntries(Object.entries(wire).map(([k, w]) => [k, w.value]));
 
     if (isSameOriginUrl(entry)) {
-      attachIframe(rt, cfg, container, entry, { injected: true, frameClock, strictSandbox: cfg.webSandbox === "strict" });
+      attachIframe(rt, cfg, container, entry, { injected: true, frameClock, strictSandbox: webSandboxIsStrict(cfg) });
       startPumps();
       const f = rt.iframe;
       f?.addEventListener(
@@ -1363,7 +1437,7 @@ export function mountWeb(rt: Runtime, cfg: WallpaperConfig) {
         URL.revokeObjectURL(blobUrl);
         return;
       }
-      attachIframe(rt, cfg, container, blobUrl, { blobUrl, injected: true, frameClock, strictSandbox: cfg.webSandbox === "strict" });
+      attachIframe(rt, cfg, container, blobUrl, { blobUrl, injected: true, frameClock, strictSandbox: webSandboxIsStrict(cfg) });
       startPumps();
     } catch (e) {
       finishBare(e instanceof Error ? e.message : String(e));

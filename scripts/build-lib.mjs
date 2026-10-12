@@ -15,12 +15,15 @@
  */
 import { build } from "vite";
 import { fileURLToPath } from "node:url";
+import { glslPlugin } from "./lib/glsl-plugin.mjs";
 
 const entry = (p) => fileURLToPath(new URL(`../renderer/src/api/${p}`, import.meta.url));
 
 const base = {
   configFile: false,
   publicDir: false, // 库产物不带 public/（降级页等属宿主资产）
+  // .glsl 独立文件在打包期转 JS 模块并剥掉 GLSL 注释/空行（issue #14）
+  plugins: [glslPlugin()],
   build: {
     target: "es2022",
     outDir: "dist/lib",

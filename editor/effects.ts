@@ -20,6 +20,37 @@ import type { EditorDoc, SceneObject } from "./doc";
 import { createRegistry } from "./core";
 import { expandShader } from "./shader-lib";
 
+// GLSL 源码独立成 .glsl 文件（issue #14）：高亮 / 维护友好，打包时剥注释/空行。
+// 本模块仍负责 def() 的组装（头部 + uniform 契约注释 + main() 包壳），.glsl 只放
+// 函数体 / 声明段 / 整段源码 —— uniform 注释契约由 uniforms() 生成，不进 .glsl。
+import VERT_RAW from "./shaders/effects/common.vert.glsl";
+import HEAD_RAW from "./shaders/effects/frag-head.glsl";
+import TINT_BODY from "./shaders/effects/tint.body.glsl";
+import ADJUST_BODY from "./shaders/effects/adjust.body.glsl";
+import VIGNETTE_BODY from "./shaders/effects/vignette.body.glsl";
+import BLUR_BODY from "./shaders/effects/blur.body.glsl";
+import WAVE_BODY from "./shaders/effects/wave.body.glsl";
+import SCROLL_BODY from "./shaders/effects/scroll.body.glsl";
+import PULSE_BODY from "./shaders/effects/pulse.body.glsl";
+import OUTLINE_BODY from "./shaders/effects/outline.body.glsl";
+import GLOW_BODY from "./shaders/effects/glow.body.glsl";
+import CHROMA_BODY from "./shaders/effects/chroma.body.glsl";
+import PIXELATE_BODY from "./shaders/effects/pixelate.body.glsl";
+import SHINE_BODY from "./shaders/effects/shine.body.glsl";
+import FADE_BODY from "./shaders/effects/fade.body.glsl";
+import RESOLUTION_DECL from "./shaders/effects/resolution.decl.glsl";
+import TIME_DECL from "./shaders/effects/time.decl.glsl";
+import CUILIUTI_HEAD from "./shaders/effects/cuiliuti.head.glsl";
+import CUILIUTI_SRC_RAW from "./shaders/effects/cuiliuti.src.glsl";
+import AUDIOBARS_DECL_RAW from "./shaders/effects/audiobars.decl.glsl";
+import AUDIOBARS_BODY_RAW from "./shaders/effects/audiobars.body.glsl";
+
+/**
+ * .glsl 模块文本归一：文件末尾统一有一个换行，拼装时去掉，保持与旧内联模板逐字节一致
+ * （def() 的产物格式是 WE 工程的落盘文本，不能多个/少个换行）。
+ */
+const nl = (s: string) => s.replace(/\n+$/, "");
+
 export type EffectParamType = "float" | "int" | "bool" | "color" | "vec2" | "vec3" | "vec4";
 
 export type EffectParam = {
@@ -68,23 +99,6 @@ export type EffectDef = {
 
 export const EFFECT_PREFIX = "wwgl_";
 
-const VERT = `// WebWallGL 编辑器内置效果：通用全层顶点着色器
-uniform mat4 g_ModelViewProjectionMatrix;
-
-attribute vec3 a_Position;
-attribute vec2 a_TexCoord;
-
-varying vec2 v_TexCoord;
-
-void main() {
-	gl_Position = mul(vec4(a_Position, 1.0), g_ModelViewProjectionMatrix);
-	v_TexCoord = a_TexCoord;
-}
-`;
-
-const HEAD = `varying vec2 v_TexCoord;
-uniform sampler2D g_Texture0; // {"hidden":true}
-`;
 
 const fmt = (v: number) => String(Math.round(v * 1e4) / 1e4);
 const defaultLiteral = (p: EffectParam) =>
@@ -106,7 +120,7 @@ export function uniforms(params: readonly EffectParam[]): string {
 export const uniformName = (key: string) => `g_Fx${key[0].toUpperCase()}${key.slice(1)}`;
 
 function def(id: string, params: EffectParam[], body: string, extra = ""): EffectDef {
-  return { id, params, frag: `// WebWallGL 编辑器内置效果：${id}\n${HEAD}${extra}${uniforms(params)}\n\nvoid main() {\n${body}\n}\n` };
+  return { id, params, frag: `// WebWallGL 编辑器内置效果：${id}\n${HEAD_RAW}${extra}${uniforms(params)}\n\nvoid main() {\n${body}\n}\n` };
 }
 
 /** 插件写效果的便捷构造：只给 main 体（body）或整段源码（frag / passes），头部与 uniform 自动生成 */
@@ -121,7 +135,7 @@ export type EffectSpec = Omit<EffectDef, "frag" | "passes"> & {
 
 const passSource = (id: string, params: readonly EffectParam[], pass: number, frag: string | undefined, body: string | undefined, decl = "") =>
   frag ??
-  `// WebWallGL 插件效果：${id}${pass ? ` pass ${pass}` : ""}\n${HEAD}${decl}${uniforms(params.filter((p) => (p.pass ?? 0) === pass))}\n\nvoid main() {\n${body ?? "\tgl_FragColor = texSample2D(g_Texture0, v_TexCoord);"}\n}\n`;
+  `// WebWallGL 插件效果：${id}${pass ? ` pass ${pass}` : ""}\n${HEAD_RAW}${decl}${uniforms(params.filter((p) => (p.pass ?? 0) === pass))}\n\nvoid main() {\n${body ?? "\tgl_FragColor = texSample2D(g_Texture0, v_TexCoord);"}\n}\n`;
 
 export function defineEffect(spec: EffectSpec): EffectDef {
   const { body, declarations, frag, passes, ...rest } = spec;
@@ -157,149 +171,6 @@ const CUILIUTI_PARAMS: EffectParam[] = [
   { key: "edgeglow", type: "float", default: 1, min: 0, max: 2, step: 0.05 },
 ];
 
-const CUILIUTI_SRC = `#define PI 3.1415927
-#define STEPS 100
-#define AO_STEPS 8
-#define SMOOTHING_VAL 0.06
-#define numBlobs 120
-
-const float GRADIENT_ROTATION = 0.0;
-const float CAMERA_DISTANCE = 4.5;
-const float EDGE_SMOOTHNESS = 0.05;
-const float EDGE_WIDTH = 1.0;
-const float MIN_BLOB_SIZE = 0.02;
-const float CENTER_CONCENTRATION = 1.0;
-const float FL = 2.0;
-const vec3 LOOK_AT = vec3(0.0, 0.0, 0.0);
-const vec3 HIGHLIGHT1_COLOR = vec3(1.0, 1.0, 1.0);
-const float HIGHLIGHT1_INTENSITY = 0.5;
-const float HIGHLIGHT1_CONCENTRATION = 16.0;
-const float HIGHLIGHT1_H = 136.0;
-const float HIGHLIGHT1_V = 180.0;
-const vec3 HIGHLIGHT2_COLOR = vec3(0.8, 0.8, 1.0);
-const float HIGHLIGHT2_INTENSITY = 0.3;
-const float HIGHLIGHT2_CONCENTRATION = 16.0;
-const float HIGHLIGHT2_H = 60.0;
-const float HIGHLIGHT2_V = 20.0;
-
-vec4 hash41(float src) {
-	vec4 p4 = fract(vec4(src, src, src, src) * vec4(0.1031, 0.1136, 0.1375, 0.1543));
-	p4 += dot(p4, p4.wzxy + 33.33);
-	return fract((p4.xxyz + p4.yzzw) * p4.zywx);
-}
-
-float smin(float a, float b, float k) {
-	k *= 6.0;
-	float h = max(k - abs(a - b), 0.0) / k;
-	return min(a, b) - h * h * h * k * (1.0 / 6.0);
-}
-
-vec4 getBlob(int i, float time) {
-	vec4 rand1 = hash41(float(i));
-	vec4 rand2 = hash41(float(i) * 1.3145);
-	vec3 freq = mix(vec3(0.4, 0.4, 0.4), vec3(2.8, 2.8, 2.8), rand1.xyz);
-	vec3 phase = mix(vec3(0.0, 0.0, 0.0), vec3(2.0 * PI, 2.0 * PI, 2.0 * PI), rand2.xyz);
-	float moveRad = mix(0.2, 1.0, rand2.w);
-	float rad = max(mix(0.15, 0.5, rand1.w * rand1.w) * exp(-moveRad * 1.75), MIN_BLOB_SIZE);
-	freq *= g_FxSpeed;
-	rad *= g_FxScale;
-	moveRad *= g_FxMotion;
-	vec3 bp = vec3(sin(time * freq.x + phase.x), cos(time * freq.y + phase.y), sin(time * freq.z + phase.z)) * vec3(moveRad, moveRad, moveRad);
-	return vec4(bp, rad);
-}
-
-float map(vec3 p) {
-	float d = 100000.0;
-	int blobCount = int(g_FxBlobs);
-	for (int i = 0; i < blobCount; i++) {
-		if (i >= numBlobs) break;
-		vec4 blob = getBlob(i, g_Time);
-		d = smin(d, length(p - blob.xyz) - blob.w, SMOOTHING_VAL * g_FxFusion);
-	}
-	return d;
-}
-
-float March(vec3 ro, vec3 rd, out float endD) {
-	float t = 0.0;
-	for (int i = 0; i < STEPS; i++) {
-		vec3 p = ro + t * rd;
-		float d = map(p);
-		endD = d;
-		if (d < 0.001) return t;
-		t += d;
-		if (t > 20.0) return t;
-	}
-	return t;
-}
-
-vec3 Normal(vec3 p) {
-	const float h = 0.001;
-	const vec2 k = vec2(1.0, -1.0);
-	return normalize(k.xyy * map(p + k.xyy * h) +
-	                 k.yyx * map(p + k.yyx * h) +
-	                 k.yxy * map(p + k.yxy * h) +
-	                 k.xxx * map(p + k.xxx * h));
-}
-
-float AO(vec3 pos, vec3 nor) {
-	float occ = 0.0;
-	float sca = 1.0;
-	for (int i = 0; i < AO_STEPS; i++) {
-		float t = 0.01 + 0.08 * float(i);
-		float d = map(pos + t * nor);
-		occ += (t - d) * sca;
-		sca *= 0.85;
-	}
-	return clamp(1.0 - occ / 3.14, 0.0, 1.0);
-}
-
-vec3 Render(vec3 ro, vec3 rd, float d) {
-	vec3 p = ro + d * rd;
-	vec3 nor = Normal(p);
-	vec3 lightDir = normalize(vec3(-1.0, 2.0, 0.0));
-	float ssFake = clamp(dot(nor, lightDir) * 0.5 + 0.5, 0.0, 1.0);
-	float ao = AO(p, nor);
-	float ambientStrength = 0.2 + 0.6 * clamp((CENTER_CONCENTRATION - 0.1) / 2.9, 0.0, 1.0);
-	vec3 lighting = mix(vec3(ambientStrength, ambientStrength, ambientStrength), vec3(1.0, 1.0, 1.0), ssFake);
-	vec3 liquidCol = g_FxLiquid * lighting * (ao * 0.5 + 0.5);
-	vec3 highlight1Dir = normalize(vec3(
-		cos(HIGHLIGHT1_H * PI / 180.0) * sin(HIGHLIGHT1_V * PI / 180.0),
-		cos(HIGHLIGHT1_V * PI / 180.0),
-		sin(HIGHLIGHT1_H * PI / 180.0) * sin(HIGHLIGHT1_V * PI / 180.0)
-	));
-	vec3 highlight2Dir = normalize(vec3(
-		cos(HIGHLIGHT2_H * PI / 180.0) * sin(HIGHLIGHT2_V * PI / 180.0),
-		cos(HIGHLIGHT2_V * PI / 180.0),
-		sin(HIGHLIGHT2_H * PI / 180.0) * sin(HIGHLIGHT2_V * PI / 180.0)
-	));
-	vec3 refDir = reflect(rd, nor);
-	float highlight1 = pow(clamp(dot(refDir, highlight1Dir), 0.0, 1.0), HIGHLIGHT1_CONCENTRATION);
-	float highlight2 = pow(clamp(dot(refDir, highlight2Dir), 0.0, 1.0), HIGHLIGHT2_CONCENTRATION);
-	liquidCol += HIGHLIGHT1_COLOR * highlight1 * HIGHLIGHT1_INTENSITY;
-	liquidCol += HIGHLIGHT2_COLOR * highlight2 * HIGHLIGHT2_INTENSITY;
-	float gradientAngle = GRADIENT_ROTATION * PI / 180.0;
-	float gradientFactor = clamp(dot(p.xy, vec2(cos(gradientAngle), sin(gradientAngle))) * 0.5 + 0.5, 0.0, 1.0);
-	float rimIntensity = pow(1.0 - abs(dot(rd, nor)), 4.0 / max(0.1, EDGE_WIDTH)) * g_FxEdgeglow;
-	liquidCol += mix(g_FxEdge1, g_FxEdge2, gradientFactor) * rimIntensity;
-	return clamp(liquidCol, vec3(0.0, 0.0, 0.0), vec3(1.0, 1.0, 1.0));
-}
-
-void main() {
-	vec2 uv = v_TexCoord * 2.0 - 1.0;
-	uv.x *= g_TexelSize.y / g_TexelSize.x;
-	vec3 ro = vec3(0.0, 0.0, CAMERA_DISTANCE);
-	vec3 cf = normalize(LOOK_AT - ro);
-	vec3 cr = normalize(cross(cf, vec3(0.0, 1.0, 0.0)));
-	vec3 cu = normalize(cross(cr, cf));
-	vec3 rd = normalize(uv.x * cr + uv.y * cu + FL * cf);
-	float endD;
-	float d = March(ro, rd, endD);
-	float edgeAlpha = 1.0 - smoothstep(0.001, 0.001 + EDGE_SMOOTHNESS, endD);
-	vec3 col = vec3(0.0, 0.0, 0.0);
-	if (edgeAlpha > 0.0) col = Render(ro, rd, d);
-	col = pow(col, vec3(1.0 / 2.2, 1.0 / 2.2, 1.0 / 2.2));
-	gl_FragColor = vec4(col, g_FxAlpha * edgeAlpha);
-}`;
 
 /** 音频频谱条的参数与着色器：柱子从中线向上下长（不依赖 v_TexCoord 的上下方向） */
 const AUDIOBARS_PARAMS: EffectParam[] = [
@@ -313,28 +184,7 @@ const AUDIOBARS_PARAMS: EffectParam[] = [
 
 // WE 内置 uniform 名（renderer 按名绑定；官方 pulse / shake / Simple Audio Bars 用的同一组）。
 // 只声明 32 段一组：柱子按 32 段画，粒子 / 文字脚本另有自己的入口。
-const AUDIOBARS_DECL = `uniform float g_AudioSpectrum32Left[32];
-uniform float g_AudioSpectrum32Right[32];
-`;
 
-const AUDIOBARS_BODY = `	vec4 base = texSample2D(g_Texture0, v_TexCoord);
-	vec3 c = base.rgb;
-	float cell = 1.0 / 32.0;
-	float x = g_FxMirror > 0.5 ? abs(v_TexCoord.x * 2.0 - 1.0) : v_TexCoord.x;
-	float d = abs(v_TexCoord.y - 0.5) * 2.0;
-	float w = max(g_FxWidth * cell * 0.5, 0.001);
-	for (int i = 0; i < 32; ++i) {
-		float band = clamp((g_AudioSpectrum32Left[i] + g_AudioSpectrum32Right[i]) * 0.5 * g_FxScale, 0.0, 1.0);
-		if (band > 0.0) {
-			float bx = abs(x - (float(i) + 0.5) * cell);
-			float barH = band * 0.5;
-			float barX = 1.0 - smoothstep(w - g_FxSoftness * w, w, bx);
-			float barY = 1.0 - smoothstep(barH - g_FxSoftness * 0.5, barH, d);
-			c = mix(c, g_FxColor, clamp(barX * barY * g_FxAmount, 0.0, 1.0));
-		}
-	}
-	gl_FragColor = vec4(c, base.a);
-`;
 
 export const EFFECTS: readonly EffectDef[] = [
   def(
@@ -343,9 +193,7 @@ export const EFFECTS: readonly EffectDef[] = [
       { key: "color", type: "color", default: [1, 0.45, 0.2] },
       { key: "amount", type: "float", default: 0.5, min: 0, max: 1, step: 0.01 },
     ],
-    `	vec4 c = texSample2D(g_Texture0, v_TexCoord);
-	c.rgb = mix(c.rgb, g_FxColor, g_FxAmount);
-	gl_FragColor = c;`,
+    nl(TINT_BODY),
   ),
   def(
     "adjust",
@@ -354,12 +202,7 @@ export const EFFECTS: readonly EffectDef[] = [
       { key: "contrast", type: "float", default: 1, min: 0, max: 3, step: 0.01 },
       { key: "saturation", type: "float", default: 1, min: 0, max: 3, step: 0.01 },
     ],
-    `	vec4 c = texSample2D(g_Texture0, v_TexCoord);
-	vec3 rgb = c.rgb + vec3(g_FxBrightness, g_FxBrightness, g_FxBrightness);
-	rgb = (rgb - vec3(0.5, 0.5, 0.5)) * g_FxContrast + vec3(0.5, 0.5, 0.5);
-	float l = dot(rgb, vec3(0.299, 0.587, 0.114));
-	rgb = mix(vec3(l, l, l), rgb, g_FxSaturation);
-	gl_FragColor = vec4(clamp(rgb, 0.0, 1.0), c.a);`,
+    nl(ADJUST_BODY),
   ),
   def(
     "vignette",
@@ -368,27 +211,13 @@ export const EFFECTS: readonly EffectDef[] = [
       { key: "radius", type: "float", default: 0.65, min: 0, max: 1.5, step: 0.01 },
       { key: "softness", type: "float", default: 0.45, min: 0.01, max: 1, step: 0.01 },
     ],
-    `	vec4 c = texSample2D(g_Texture0, v_TexCoord);
-	float d = length(v_TexCoord - vec2(0.5, 0.5)) * 1.41421356;
-	float v = 1.0 - smoothstep(g_FxRadius - g_FxSoftness, g_FxRadius, d);
-	c.rgb *= mix(1.0, v, g_FxStrength);
-	gl_FragColor = c;`,
+    nl(VIGNETTE_BODY),
   ),
   def(
     "blur",
     [{ key: "radius", type: "float", default: 2, min: 0, max: 8, step: 0.1 }],
-    `	vec2 px = g_FxRadius / max(g_Texture0Resolution.xy, vec2(1.0, 1.0));
-	vec4 sum = vec4(0.0, 0.0, 0.0, 0.0);
-	float wsum = 0.0;
-	for (int i = -3; i <= 3; i++) {
-		for (int j = -3; j <= 3; j++) {
-			float w = exp(-float(i * i + j * j) / 8.0);
-			sum += texSample2D(g_Texture0, v_TexCoord + vec2(float(i), float(j)) * px) * w;
-			wsum += w;
-		}
-	}
-	gl_FragColor = sum / wsum;`,
-    "uniform vec4 g_Texture0Resolution;\n",
+    nl(BLUR_BODY),
+    RESOLUTION_DECL,
   ),
   def(
     "wave",
@@ -397,12 +226,8 @@ export const EFFECTS: readonly EffectDef[] = [
       { key: "frequency", type: "float", default: 4, min: 0, max: 40, step: 0.1 },
       { key: "speed", type: "float", default: 1, min: 0, max: 10, step: 0.05 },
     ],
-    `	vec2 uv = v_TexCoord;
-	uv.x += sin((uv.y * g_FxFrequency + g_Time * g_FxSpeed) * 6.2831853) * g_FxAmplitude;
-	vec4 c = texSample2D(g_Texture0, uv);
-	c *= step(0.0, uv.x) * step(uv.x, 1.0);
-	gl_FragColor = c;`,
-    "uniform float g_Time;\n",
+    nl(WAVE_BODY),
+    TIME_DECL,
   ),
   def(
     "scroll",
@@ -410,9 +235,8 @@ export const EFFECTS: readonly EffectDef[] = [
       { key: "speedx", type: "float", default: 0.1, min: -2, max: 2, step: 0.01 },
       { key: "speedy", type: "float", default: 0, min: -2, max: 2, step: 0.01 },
     ],
-    `	vec2 uv = fract(v_TexCoord + vec2(g_FxSpeedx, g_FxSpeedy) * g_Time);
-	gl_FragColor = texSample2D(g_Texture0, uv);`,
-    "uniform float g_Time;\n",
+    nl(SCROLL_BODY),
+    TIME_DECL,
   ),
   def(
     "pulse",
@@ -420,10 +244,8 @@ export const EFFECTS: readonly EffectDef[] = [
       { key: "speed", type: "float", default: 0.5, min: 0, max: 5, step: 0.01 },
       { key: "amount", type: "float", default: 0.5, min: 0, max: 1, step: 0.01 },
     ],
-    `	vec4 c = texSample2D(g_Texture0, v_TexCoord);
-	c.a *= 1.0 - g_FxAmount * (0.5 + 0.5 * sin(g_Time * g_FxSpeed * 6.2831853));
-	gl_FragColor = c;`,
-    "uniform float g_Time;\n",
+    nl(PULSE_BODY),
+    TIME_DECL,
   ),
   def(
     "outline",
@@ -431,15 +253,8 @@ export const EFFECTS: readonly EffectDef[] = [
       { key: "color", type: "color", default: [0, 0, 0] },
       { key: "width", type: "float", default: 3, min: 0, max: 16, step: 0.5 },
     ],
-    `	vec2 px = g_FxWidth / max(g_Texture0Resolution.xy, vec2(1.0, 1.0));
-	vec4 c = texSample2D(g_Texture0, v_TexCoord);
-	float a = 0.0;
-	for (int i = 0; i < 16; i++) {
-		float t = float(i) * 0.39269908;
-		a = max(a, texSample2D(g_Texture0, v_TexCoord + vec2(cos(t), sin(t)) * px).a);
-	}
-	gl_FragColor = vec4(mix(g_FxColor, c.rgb, c.a), max(c.a, a));`,
-    "uniform vec4 g_Texture0Resolution;\n",
+    nl(OUTLINE_BODY),
+    RESOLUTION_DECL,
   ),
   def(
     "glow",
@@ -448,20 +263,8 @@ export const EFFECTS: readonly EffectDef[] = [
       { key: "radius", type: "float", default: 4, min: 0, max: 16, step: 0.1 },
       { key: "strength", type: "float", default: 1.5, min: 0, max: 4, step: 0.05 },
     ],
-    `	vec2 px = g_FxRadius / max(g_Texture0Resolution.xy, vec2(1.0, 1.0));
-	vec4 c = texSample2D(g_Texture0, v_TexCoord);
-	float a = 0.0;
-	float wsum = 0.0;
-	for (int i = -3; i <= 3; i++) {
-		for (int j = -3; j <= 3; j++) {
-			float w = exp(-float(i * i + j * j) / 8.0);
-			a += texSample2D(g_Texture0, v_TexCoord + vec2(float(i), float(j)) * px).a * w;
-			wsum += w;
-		}
-	}
-	a = clamp(a / wsum * g_FxStrength, 0.0, 1.0);
-	gl_FragColor = vec4(mix(g_FxColor, c.rgb, c.a), max(c.a, a));`,
-    "uniform vec4 g_Texture0Resolution;\n",
+    nl(GLOW_BODY),
+    RESOLUTION_DECL,
   ),
   def(
     "chroma",
@@ -469,19 +272,13 @@ export const EFFECTS: readonly EffectDef[] = [
       { key: "amount", type: "float", default: 0.006, min: 0, max: 0.05, step: 0.0005 },
       { key: "angle", type: "float", default: 0, min: 0, max: 6.2832, step: 0.01 },
     ],
-    `	vec2 d = vec2(cos(g_FxAngle), sin(g_FxAngle)) * g_FxAmount;
-	vec4 r = texSample2D(g_Texture0, v_TexCoord + d);
-	vec4 c = texSample2D(g_Texture0, v_TexCoord);
-	vec4 b = texSample2D(g_Texture0, v_TexCoord - d);
-	gl_FragColor = vec4(r.r, c.g, b.b, max(max(r.a, c.a), b.a));`,
+    nl(CHROMA_BODY),
   ),
   def(
     "pixelate",
     [{ key: "size", type: "float", default: 8, min: 1, max: 64, step: 1 }],
-    `	vec2 cell = max(g_FxSize, 1.0) / max(g_Texture0Resolution.xy, vec2(1.0, 1.0));
-	vec2 uv = (floor(v_TexCoord / cell) + vec2(0.5, 0.5)) * cell;
-	gl_FragColor = texSample2D(g_Texture0, uv);`,
-    "uniform vec4 g_Texture0Resolution;\n",
+    nl(PIXELATE_BODY),
+    RESOLUTION_DECL,
   ),
   def(
     "shine",
@@ -492,13 +289,8 @@ export const EFFECTS: readonly EffectDef[] = [
       { key: "angle", type: "float", default: 0.6, min: 0, max: 6.2832, step: 0.01 },
       { key: "strength", type: "float", default: 0.8, min: 0, max: 2, step: 0.01 },
     ],
-    `	vec4 c = texSample2D(g_Texture0, v_TexCoord);
-	float p = dot(v_TexCoord - vec2(0.5, 0.5), vec2(cos(g_FxAngle), sin(g_FxAngle))) + 0.5;
-	float pos = fract(g_Time * g_FxSpeed) * (1.0 + 4.0 * g_FxWidth) - 2.0 * g_FxWidth;
-	float band = 1.0 - smoothstep(0.0, g_FxWidth, abs(p - pos));
-	c.rgb = clamp(c.rgb + g_FxColor * band * g_FxStrength, 0.0, 1.0);
-	gl_FragColor = c;`,
-    "uniform float g_Time;\n",
+    nl(SHINE_BODY),
+    TIME_DECL,
   ),
   def(
     "fade",
@@ -507,13 +299,7 @@ export const EFFECTS: readonly EffectDef[] = [
       { key: "start", type: "float", default: 0.2, min: -0.5, max: 1.5, step: 0.01 },
       { key: "end", type: "float", default: 0.8, min: -0.5, max: 1.5, step: 0.01 },
     ],
-    `	vec4 c = texSample2D(g_Texture0, v_TexCoord);
-	float p = dot(v_TexCoord - vec2(0.5, 0.5), vec2(cos(g_FxAngle), sin(g_FxAngle))) + 0.5;
-	float lo = min(g_FxStart, g_FxEnd);
-	float hi = max(g_FxStart, g_FxEnd) + 0.0001;
-	float m = smoothstep(lo, hi, p);
-	c.a *= g_FxStart <= g_FxEnd ? m : 1.0 - m;
-	gl_FragColor = c;`,
+    nl(FADE_BODY),
   ),
   {
     id: "cuiliuti",
@@ -524,14 +310,11 @@ export const EFFECTS: readonly EffectDef[] = [
       en: "Original author: Hope麻匪 (HopeMafei), a Wallpaper Engine community creator who publicly shared the \"Ferrofluid\" custom shader (collected by 0ran). Reimplemented here as a WebWallGL effect with sliders and zh / en labels: it looks the same as the original for the same settings.",
     },
     params: CUILIUTI_PARAMS,
-    frag: `// WebWallGL 编辑器内置效果：cuiliuti（磁流体）
-// 原作作者：Hope麻匪（HopeMafei）—— WE 社区创作者，公开分享的「磁流体」自定义 shader
-// 版权与出处：见 effect.json 的备注 / 本仓 README「效果署名与致谢」
-${HEAD}uniform float g_Time;
+    frag: `${CUILIUTI_HEAD}${HEAD_RAW}uniform float g_Time;
 uniform vec2 g_TexelSize;
 ${uniforms(CUILIUTI_PARAMS)}
 
-${CUILIUTI_SRC}
+${nl(CUILIUTI_SRC_RAW)}
 `,
   },
   // ── 音频频谱条（audiobars）───────────────────────────────────────────────
@@ -542,7 +325,7 @@ ${CUILIUTI_SRC}
   // 追加在 EFFECTS 末尾：verify-editor 断言前 13 个 id 的顺序（基础集 / 扩充集）。
   // 名字与参数文案走 i18n 的 fx.audiobars / fxp.*（内置效果一律如此，不写 title）。
   {
-    ...def("audiobars", AUDIOBARS_PARAMS, AUDIOBARS_BODY, AUDIOBARS_DECL),
+    ...def("audiobars", AUDIOBARS_PARAMS, nl(AUDIOBARS_BODY_RAW), AUDIOBARS_DECL_RAW),
     category: "audio",
   },
 ];
@@ -669,7 +452,7 @@ export function effectFiles(d: EffectDef, lang = "zh"): Array<{ name: string; da
     };
     out.push({ name: materials[i], data: enc.encode(JSON.stringify(mat, null, 2)) });
     out.push({ name: `shaders/${shader}.frag`, data: enc.encode(shaderTransform(p.frag)) });
-    out.push({ name: `shaders/${shader}.vert`, data: enc.encode(shaderTransform(p.vert ?? VERT)) });
+    out.push({ name: `shaders/${shader}.vert`, data: enc.encode(shaderTransform(p.vert ?? nl(VERT_RAW))) });
   });
   return out;
 }

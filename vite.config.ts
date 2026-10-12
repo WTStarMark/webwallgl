@@ -3,6 +3,8 @@ import { existsSync, readdirSync, rmSync } from "node:fs";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { wallpaperHost } from "./host/wallpaper-host";
+// scripts/lib/glsl-plugin.mjs：构建脚本（.mjs），JS API 装载（checkJs 未开，.mjs 不参与类型检查）
+import { glslPlugin } from "./scripts/lib/glsl-plugin.mjs";
 
 const here = (p: string) => fileURLToPath(new URL(p, import.meta.url));
 
@@ -35,7 +37,7 @@ function cleanSiteOutput(): Plugin {
 // 入口：/editor/ 工作台（壁纸库播放 + 编辑同一页，docs/EDITOR-PLAN.md §3A），
 // /renderer/index.html 渲染器页（与主项目 WallpaperEM 同路径同 query 协议），/ 只是跳到 /editor/ 的旧入口
 export default defineConfig({
-  plugins: [wallpaperHost(), cleanSiteOutput()],
+  plugins: [glslPlugin(), wallpaperHost(), cleanSiteOutput()],
   clearScreen: false,
   server: {
     port: 1430,

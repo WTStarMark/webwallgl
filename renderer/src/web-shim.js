@@ -1898,8 +1898,26 @@
     w.addEventListener("message", function (ev) {
       var d = ev && ev.data;
       if (!d || typeof d !== "object" || d.__we !== 1) return;
+      // [ENGINE-REVIEW §2.3-1] 发送方必须是**父页（宿主）**：此前只校验载荷自带的
+      // `__we === 1`，页面里任何作者脚本（或它嵌的 iframe）都能照样构造一条消息，
+      // 拿到暂停/音量/帧率/属性/指针的完整控制权。父页判定用 WindowProxy 身份比较
+      // —— 跨源（严格沙箱）下同样成立，且比 origin 字符串更难伪造。宿主如需再收
+      // 一道，可在 postMessage 前给本 window 设 `__weAllowedOrigins`（origin 白名单）。
+      if (ev.source !== w.parent) return;
+      var allowedOrigins = w.__weAllowedOrigins;
+      if (allowedOrigins && allowedOrigins.length && ev.origin &&
+          allowedOrigins.indexOf(ev.origin) < 0) return;
       try {
         switch (d.op) {
+          case "ping":
+            // [ENGINE-REVIEW §2.3-2] 宿主主动探针：只有「宿主问了、本 shim 答了」
+            // 才算壁纸还活着。页面的 we-frame 是**自报**的，宿主不拿它判活
+            //（伪造 we-frame 就能骗过看门狗、让自适应降档永不触发）。
+            // 回到发问方而不假手 w.parent：嵌套挂载时两者可能不是同一个 window。
+            if (ev.source && ev.source.postMessage) {
+              ev.source.postMessage({ __we: 1, op: "we-pong", t: d.t }, "*");
+            }
+            break;
           case "setPaused":
             w.__weSetPaused(!!d.v);
             break;
