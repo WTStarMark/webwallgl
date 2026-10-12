@@ -12,7 +12,7 @@
  */
 import fs from "node:fs";
 import { join } from "node:path";
-import { fileURLToPath } from "node:url";
+import { fileURLToPath, pathToFileURL } from "node:url";
 
 const here = join(fileURLToPath(import.meta.url), "..");
 const ROOT = join(here, "..");
@@ -29,6 +29,296 @@ function check(ok, msg) {
 // 剥注释用**字符串感知**的实现（朴素正则会吞掉字符串里含 /* 的真代码，实测踩过）。
 import { stripComments } from "./lib/source-scan.mjs";
 const read = (rel) => stripComments(fs.readFileSync(join(ROOT, rel), "utf8"));
+
+// ───────────────────── 真行为子进程模式（`--child <name>`，见文末 [8]/[9]） ─────────────────────
+// 真行为用例一律在**独立子进程**里跑，父进程只解析它吐出的 JSON 行：
+//   · 子进程带 timeout 与 --max-old-space-size 上限；
+//   · 被测路径万一退化（OOM / 挂死 / 崩溃）时，被带走的只是那个子进程
+//     —— 历史事故：一次 4.6s 内的 SIGABRT 能把整个 verifier 一起杀掉，
+//     于是「判据自己死了」被误读成「没有任何失败」。
+// 子进程里**不跑**下面的源码守卫（那些在父进程跑），只跑被点名的那个真行为用例。
+const childIdx = process.argv.indexOf("--child");
+if (childIdx >= 0) {
+  const childName = process.argv[childIdx + 1];
+  const t0 = Date.now();
+  const heap0 = process.memoryUsage().heapUsed;
+  let fatal = null;
+  try {
+    await runChildScenario(childName);
+  } catch (e) {
+    fatal = String((e && e.stack) || e).split("\n").slice(0, 3).join(" ｜ ");
+  }
+  emitChild({
+    id: "__meta",
+    ok: fatal === null,
+    msg: `子进程 ${childName} 走完（${Date.now() - t0}ms）`,
+    detail: fatal || undefined,
+    heapUsedDeltaKB: Math.round((process.memoryUsage().heapUsed - heap0) / 1024),
+  });
+  process.exit(fatal === null ? 0 : 1);
+}
+
+/** 子进程 → 父进程的唯一通道：一行一个 JSON（父进程逐行容错解析） */
+function emitChild(o) {
+  process.stdout.write(JSON.stringify(o) + "\n");
+}
+
+/** 记录型假 WebGL2：GL 常量给真值、资源创建给唯一对象、其余调用只记名。
+ *  只为让真 renderer.js 能离线跑起来（不需要 GPU / DOM），不做任何 GL 语义模拟。 */
+function makeRecorderGl() {
+  const log = [];
+  const created = () => ({ __glObj: true });
+  const RET = {
+    createShader: created,
+    createProgram: created,
+    createTexture: created,
+    createVertexArray: created,
+    createBuffer: created,
+    createFramebuffer: created,
+    createRenderbuffer: created,
+    getUniformLocation: (_p, n) => ({ __loc: n }),
+    getShaderParameter: () => true,
+    getProgramParameter: () => true,
+    getShaderInfoLog: () => "",
+    getProgramInfoLog: () => "",
+    getAttribLocation: () => 0,
+    getParameter: () => 256,
+    checkFramebufferStatus: () => 0x8cd5,
+    isContextLost: () => false,
+    getExtension: (n) => {
+      log.push({ name: "getExtension", args: [n] });
+      return n === "WEBGL_lose_context" ? { loseContext: () => log.push({ name: "ext.loseContext", args: [] }) } : null;
+    },
+  };
+  const target = { __log: log };
+  return new Proxy(target, {
+    get(t, k) {
+      if (typeof k !== "string") return undefined;
+      if (k in t) return t[k];
+      if (k in RET) return RET[k];
+      if (/^[A-Z][A-Z0-9_]*$/.test(k)) return 0x1000; // GL_* 常量
+      const fn = (...a) => {
+        log.push({ name: k, args: a });
+      };
+      RET[k] = fn;
+      return fn;
+    },
+  });
+}
+
+/** 造一个假画布（真 renderer 只用到 getContext / add-removeEventListener / 尺寸） */
+function makeFakeCanvas(gl, listeners) {
+  return {
+    width: 64,
+    height: 64,
+    getContext: () => gl,
+    addEventListener: (n, f) => listeners.set(n, f),
+    removeEventListener: (n) => listeners.delete(n),
+  };
+}
+
+async function runChildScenario(name) {
+  if (name === "context-loss") return childContextLoss();
+  if (name === "unmount-gen") return childUnmountGen();
+  throw new Error("未知子进程用例: " + name);
+}
+
+/** [8] 上下文丢失/恢复的真行为（真 renderer.js + 假 GL + 假画布） */
+async function childContextLoss() {
+  const { createRenderer } = await import(pathToFileURL(join(ROOT, "renderer/vendor/we-scene/render/renderer.js")).href);
+
+  const listeners = new Map();
+  const diags = [];
+  let prevented = 0;
+  const gl = makeRecorderGl();
+  const r = createRenderer(makeFakeCanvas(gl, listeners), { diag: (m) => diags.push(String(m)), shaderResolver: async () => null });
+
+  emitChild({
+    id: "listeners",
+    ok: listeners.has("webglcontextlost") && listeners.has("webglcontextrestored"),
+    msg: "[8.1] 丢失/恢复必须挂上画布监听（宿主没有其它途径知道该重挂载）",
+    detail: [...listeners.keys()].join(","),
+  });
+
+  listeners.get("webglcontextlost")({ preventDefault: () => prevented++ });
+  emitChild({
+    id: "lost-prevent-default",
+    ok: prevented === 1,
+    msg: "[8.2] webglcontextlost 必须 preventDefault()（不拦就没有恢复可能）",
+    detail: `prevented=${prevented}`,
+  });
+  emitChild({ id: "lost-state", ok: r.contextLost() === true, msg: "[8.3] 丢失后 contextLost() 必须为 true（宿主据此冻结并重挂）" });
+  emitChild({
+    id: "lost-diag",
+    ok: diags.length === 1 && /上下文丢失/.test(diags[0]) && /重挂载/.test(diags[0]),
+    msg: "[8.4] 丢失必须上报一条含「上下文丢失 … 重挂载」的诊断",
+    detail: `diags=${diags.length}`,
+  });
+
+  // 重复丢失：诊断只能一条（否则刷屏），但每次仍要 preventDefault（浏览器会重复派发）
+  listeners.get("webglcontextlost")({ preventDefault: () => prevented++ });
+  emitChild({
+    id: "lost-diag-once",
+    ok: diags.length === 1 && prevented === 2,
+    msg: "[8.5] 重复丢失不得重复上报，但每次都要 preventDefault",
+    detail: `diags=${diags.length} prevented=${prevented}`,
+  });
+
+  // 恢复：引擎**不**重建 GL 资源（句柄已失效），必须再上报一条并保持丢失态
+  listeners.get("webglcontextrestored")({});
+  emitChild({
+    id: "restored-diag",
+    ok: diags.length === 2 && /重挂载/.test(diags[1]),
+    msg: "[8.6] 恢复后必须再上报一条（引擎不重建资源，宿主必须重挂）",
+    detail: `diags=${diags.length}`,
+  });
+  emitChild({ id: "restored-keeps-lost", ok: r.contextLost() === true, msg: "[8.7] 恢复事件不得清掉丢失态（谎报已恢复 = 黑屏继续跑）" });
+
+  // 浏览器已判死但没派事件：render() 必须零绘制短路，且补一条诊断（只补一次）
+  {
+    const gl2 = makeRecorderGl();
+    gl2.isContextLost = () => true;
+    const listeners2 = new Map();
+    const diags2 = [];
+    const r2 = createRenderer(makeFakeCanvas(gl2, listeners2), { diag: (m) => diags2.push(String(m)), shaderResolver: async () => null });
+    const n0 = gl2.__log.length;
+    await r2.render(null, [], 16, 16, 0, "cover", 0.5, 0.5, null);
+    const draws = gl2.__log.slice(n0).filter((e) => /^(draw|uniform|bindTexture|texImage|viewport|clear)/.test(e.name));
+    emitChild({
+      id: "iscontextlost-shortcircuit",
+      ok: draws.length === 0,
+      msg: "[8.8] gl.isContextLost() 为真时 render() 必须零 GL 绘制调用直接返回（否则每帧全变 no-op，还骗出「rAF 照跑 fps 照计」）",
+      detail: draws.map((e) => e.name).join(",") || "无调用",
+    });
+    emitChild({
+      id: "iscontextlost-diag",
+      ok: diags2.length === 1 && /上下文丢失/.test(diags2[0]),
+      msg: "[8.9] 浏览器判死但没派事件时，短路路径也要补上报一条诊断",
+      detail: `diags=${diags2.length}`,
+    });
+    await r2.render(null, [], 16, 16, 0, "cover", 0.5, 0.5, null);
+    emitChild({ id: "iscontextlost-diag-once", ok: diags2.length === 1, msg: "[8.10] 第二次短路不得再上报（诊断一次性）" });
+    r2.dispose();
+  }
+
+  // dispose 的顺序契约：先摘监听 → 释放 GL 资源 → 最后 loseContext
+  {
+    const n0 = gl.__log.length;
+    r.dispose();
+    const tail = gl.__log.slice(n0);
+    const deleteIdxs = tail.map((e, i) => (/^delete/.test(e.name) ? i : -1)).filter((i) => i >= 0);
+    const loseIdx = tail.findIndex((e) => e.name === "ext.loseContext");
+    emitChild({
+      id: "dispose-listeners",
+      ok: listeners.size === 0,
+      msg: "[8.11] dispose() 必须先摘掉自己的上下文监听（不摘会把自己的拆卸记成故障）",
+      detail: `left=${[...listeners.keys()].join(",") || "无"}`,
+    });
+    emitChild({
+      id: "dispose-order",
+      ok: deleteIdxs.length > 0 && loseIdx > deleteIdxs[deleteIdxs.length - 1],
+      msg: "[8.12] 释放 GL 资源（delete*）必须早于 loseContext（顺序反了 delete 全成 no-op）",
+      detail: `deletes=${deleteIdxs.length} loseContext@${loseIdx}`,
+    });
+  }
+}
+
+/** [9] 装配-卸载代际的真行为（esbuild 现编 shell.ts → data: URL 真跑） */
+async function childUnmountGen() {
+  const { build } = await import("esbuild");
+  const res = await build({
+    entryPoints: [join(ROOT, "renderer/src/shell.ts")],
+    bundle: true,
+    write: false,
+    format: "esm",
+    platform: "neutral",
+    target: "es2022",
+    logLevel: "silent",
+  });
+  // 走 data: URL 而不是临时文件：整段 bundle 不落盘，DOM 桩也只活在这个子进程里
+  const code = res.outputFiles[0].text;
+
+  const calls = [];
+  globalThis.window = { addEventListener() {}, removeEventListener() {}, devicePixelRatio: 1, innerWidth: 100, innerHeight: 100 };
+  globalThis.document = {
+    addEventListener() {},
+    removeEventListener() {},
+    documentElement: { style: {} },
+    body: { style: {}, appendChild() {} },
+    createElement: () => ({ style: {}, remove() {} }),
+  };
+  globalThis.cancelAnimationFrame = (id) => calls.push({ name: "cancelAnimationFrame", arg: id });
+  globalThis.requestAnimationFrame = () => 1;
+  const realRevoke = globalThis.URL.revokeObjectURL;
+  globalThis.URL.revokeObjectURL = (u) => {
+    calls.push({ name: "revokeObjectURL", arg: u });
+  };
+
+  const mod = await import("data:text/javascript;base64," + Buffer.from(code).toString("base64"));
+
+  const rt = mod.createRuntime({});
+  emitChild({ id: "gen-init", ok: rt.gen === 0, msg: "[9.1] 新 runtime 的代际必须从 0 开始", detail: `gen=${rt.gen}` });
+
+  // 真装配期句柄的替身：每个回调都读**当下**的 rt.gen —— 于是「自增是否在最前」看得见
+  const seen = [];
+  rt.renderer = { dispose: () => seen.push({ what: "renderer.dispose", gen: rt.gen }) };
+  rt.videoPairs = [{ destroy: () => seen.push({ what: "videoPairs.destroy", gen: rt.gen }) }];
+  rt.sceneCleanup = () => seen.push({ what: "sceneCleanup", gen: rt.gen });
+  rt.raf = 4242;
+  rt.objectUrls = ["blob:fake/1"];
+
+  mod.clear(rt);
+  const idx = (n) => seen.findIndex((s) => s.what === n);
+  const count = (n) => seen.filter((s) => s.what === n).length;
+  emitChild({ id: "gen-first-clear", ok: rt.gen === 1, msg: "[9.2] 第一次 clear 必须把代际推到 1", detail: `gen=${rt.gen}` });
+  emitChild({
+    id: "gen-before-teardown",
+    ok: seen.length === 3 && seen.every((s) => s.gen === 1),
+    msg: "[9.3] 代际自增必须发生在同一轮**所有**拆卸动作之前（在飞的装配体只靠 rt.gen 判断自己作废）",
+    detail: JSON.stringify(seen),
+  });
+  emitChild({
+    id: "teardown-order",
+    ok: idx("videoPairs.destroy") >= 0 && idx("videoPairs.destroy") < idx("sceneCleanup") && idx("sceneCleanup") < idx("renderer.dispose"),
+    msg: "[9.4] 拆卸顺序：rAF/视频对 → sceneCleanup → renderer.dispose（清理抛错被 try/catch 吞，但顺序不能反）",
+    detail: seen.map((s) => s.what).join(" → "),
+  });
+  emitChild({
+    id: "raf-cancelled",
+    ok: calls.some((c) => c.name === "cancelAnimationFrame" && c.arg === 4242),
+    msg: "[9.5] clear 必须取消在跑的 rAF（否则旧场景继续往已拆的画布画）",
+  });
+  emitChild({
+    id: "blob-revoked",
+    ok: calls.some((c) => c.name === "revokeObjectURL" && c.arg === "blob:fake/1"),
+    msg: "[9.6] clear 必须 revoke 旧场景的 blob URL",
+  });
+  emitChild({
+    id: "fields-cleared",
+    ok:
+      rt.iframe === undefined &&
+      rt.canvas === undefined &&
+      rt.renderer === undefined &&
+      rt.videoPairs === undefined &&
+      rt.objectUrls === undefined &&
+      rt.sceneCleanup === undefined &&
+      rt.raf === undefined,
+    msg: "[9.7] clear 后装配期句柄必须全部置空（留着等于把已拆的东西继续暴露给宿主）",
+    detail: JSON.stringify({ iframe: rt.iframe ?? null, canvas: rt.canvas ?? null, renderer: rt.renderer ?? null, raf: rt.raf ?? null }),
+  });
+
+  mod.clear(rt);
+  emitChild({ id: "gen-second-clear", ok: rt.gen === 2, msg: "[9.8] 第二次 clear 必须继续自增（1 → 2）", detail: `gen=${rt.gen}` });
+  emitChild({
+    id: "teardown-once",
+    ok: count("renderer.dispose") === 1 && count("sceneCleanup") === 1,
+    msg: "[9.9] 第二次 clear 不得重复 dispose（句柄已置空；重复 = 二次释放）",
+    detail: `renderer.dispose=${count("renderer.dispose")} sceneCleanup=${count("sceneCleanup")}`,
+  });
+
+  if (realRevoke) globalThis.URL.revokeObjectURL = realRevoke;
+}
+
 
 console.log("\n[1] 代际令牌：Runtime.gen 由 clear() 自增");
 {
@@ -153,6 +443,64 @@ console.log("\n[7] GL 资源所有权（M3 作用域）：puppet 侧也要能枚
   const sm = read("renderer/src/scene-mount.ts");
   check(/thisMdl\.dispose\?\.\(\)/.test(sm), "装配层必须在 sceneCleanup 里调 mdlRenderer.dispose()");
 }
+
+// ────────────── [8]/[9] 真行为（子进程 + 超时 + 堆上限 + 有界分配） ──────────────
+// 为什么单列这两节：上面 [1]~[7] 全是源码正则守卫 —— 能证明「接线还在」，
+// 证明不了「跑起来真的是这个行为」。本节把两条真行为路径拉到离线门禁里：
+//   [8] 上下文丢失/恢复：真 renderer.js + 假 GL/假画布（不需要 GPU 与 DOM）；
+//   [9] 装配-卸载代际：esbuild 现编 shell.ts → 真 createRuntime/clear。
+// 每个用例一个子进程（见文件头的子进程模式说明），父进程按 JSON 行逐条判。
+async function realLifecycleBehavior() {
+  console.log("\n[8]/[9] 真行为（子进程 + 超时 + 堆上限）：上下文丢失/恢复 与 装配-卸载代际");
+  const { spawnSync } = await import("node:child_process");
+  const TIMEOUT_MS = 30000;
+  const HEAP_CAP_KB = 32 * 1024;
+  const CASES = [
+    { id: "context-loss", heapMB: 128 },
+    { id: "unmount-gen", heapMB: 512 },
+  ];
+  for (const c of CASES) {
+    const t0 = Date.now();
+    const r = spawnSync(process.execPath, [`--max-old-space-size=${c.heapMB}`, fileURLToPath(import.meta.url), "--child", c.id], {
+      timeout: TIMEOUT_MS,
+      encoding: "utf8",
+      maxBuffer: 4 * 1024 * 1024,
+    });
+    const ms = Date.now() - t0;
+    // 子进程被 OOM/信号带走时 stdout 可能半行截断：逐行容错解析，缺项自己会说话
+    const rows = [];
+    for (const line of (r.stdout || "").split("\n")) {
+      const s = line.trim();
+      if (!s.startsWith("{")) continue;
+      try {
+        rows.push(JSON.parse(s));
+      } catch {
+        /* 半行截断，忽略 */
+      }
+    }
+    const died = !!r.error || r.signal !== null || r.status !== 0;
+    check(
+      !died,
+      `[${c.id}] 子进程必须正常退出（exit=${r.status} signal=${r.signal || "-"} ${ms}ms 堆上限=${c.heapMB}MB${r.error ? " err=" + String(r.error.message).slice(0, 90) : ""}）—— 被信号带走/超时通常意味着被测路径退化`,
+    );
+    const meta = rows.find((x) => x.id === "__meta");
+    check(rows.length >= 2 && !!meta, `[${c.id}] 子进程必须产出用例结果（实得 ${rows.length} 行；缺项通常意味着中途崩了）`);
+    for (const row of rows) {
+      if (row.id === "__meta") continue;
+      check(row.ok === true, `${row.msg || row.id}${row.ok ? "" : ` ｜ 实得：${row.detail ?? "（无细节）"}`}`);
+    }
+    if (meta) {
+      check(
+        typeof meta.heapUsedDeltaKB === "number" && meta.heapUsedDeltaKB < HEAP_CAP_KB,
+        `[${c.id}] 有界分配：子进程堆增量必须 < 32MB（实得 ${meta.heapUsedDeltaKB}KB）`,
+      );
+      if (!meta.ok) check(false, `[${c.id}] 子进程自报致命错误：${meta.detail}`);
+    }
+    if (r.stderr && r.stderr.trim()) console.error(`  · [${c.id}] 子进程 stderr：${r.stderr.trim().split("\n")[0].slice(0, 160)}`);
+  }
+}
+
+await realLifecycleBehavior();
 
 console.log(failed === 0 ? "\nverify-lifecycle: 全部通过 ✓" : `\nverify-lifecycle: ${failed} 项失败 ✗`);
 process.exit(failed === 0 ? 0 : 1);

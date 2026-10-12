@@ -87,6 +87,10 @@ const STABLE = [
   // 实例生命周期/代际（M4）：终态、await 后代际核对、旧代不触发新代首帧、画布所有权
   // （源码守卫；行为面见 scripts/_probe-review-lifecycle.mjs 的无头真装配）
   "verify-lifecycle",
+  // 雾的数值契约（M1.3/M1.6，2026-10-12）：解析式 t² 曲线 + 先高度后距离、`script`/`{value}`
+  // 解包与除零保护（真跑 scene-mount.ts 的 sceneFog 切片）、7 个 uniform 与 FOG 门控。
+  // 此前雾只被 FLAKY 的 verify-particles 覆盖 ⇒ 实际无门禁（verify-particles 不在稳定集）
+  "verify-fog",
   // 噪声路径逐位等价（粒子热点的单元格角点缓存；0 容差对拍 + A/B 开关）
   "verify-noise",
   // 内置贴图像素金样（mulberry32 收敛 B1；82 张 + 种子表）
@@ -95,6 +99,21 @@ const STABLE = [
   "verify-mat",
   // 着色器链接唯一实现契约（B3：属性表 / 不绑语义 / mdl 骨预算重试保留）
   "verify-link",
+  // G10：HLSL 宏体负字面量的括号化（`#define X -1.3` 展开成 `(-1.3)`，避免 `a - -1.3`
+  // 被折叠成 `a--1.3` 后整段 pass 被跳过）+ 负值 combo。13 条合成夹具 + 裸替换对照尺。
+  "verify-hlsl-macro",
+  // M1.4 脚本沙箱：三条已知逃逸向量（fnCtor / arrCtor / indirEval）钉住当前真实行为 +
+  // M7(B+C) 通道收紧的文本判据。逃逸向量用子进程跑（20s 硬超时），不读素材库。
+  "verify-sandbox",
+  // 本波（we-native-constants）四份「原生常量对账」判据：只读本仓源码 + 只读第一方语料，
+  // 不依赖任何外部工具链（原生证据列为 null 时跳过并打印 unknown 清单，填值即自动启用断言）。
+  //   状态机 / .tex 头与 format 枚举 / 光照 9 键 + 着色器 5 项 / 粒子 9 段 / 场景脚本 6 判定 / 相机 5 组
+  "verify-native-state",
+  "verify-tex-constants",
+  "verify-light-constants",
+  "verify-particle-constants",
+  "verify-scenescript-constants",
+  "verify-camera-constants",
   // 松散目录形态的场景壁纸（源码工程 / 官方内置 defaultprojects）：判定表与回退语义
   // 真跑（含本地 HTTP 服务器）、本地库 17 个条目的引用闭包审计、接线守卫、变异红测。
   // 真 GPU A/B 不在稳定集里（要 Chrome + 自起 dev server）：`node scripts/verify-loose.mjs --headless`

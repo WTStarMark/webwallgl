@@ -56,7 +56,7 @@ const num = (v, d) => {
   check(Math.abs(cover(dur / 2) - 0.5) < 1e-6, `淡入中点应为 0.5，实测 ${cover(dur / 2)}`);
 }
 
-// ---------- 2. 抖动连续性 + 运动模型（对齐 linux-wallpaperengine 逆向实现） ----------
+// ---------- 2. 抖动连续性 + 运动模型（对齐 linux-wallpaperengine 开源实现） ----------
 {
   // 与 renderer.js 的 cameraShakeOffset 逐字一致（节拍模型，2026-09-27 重写）。
   // 模型来源：AzPepoze/linux-wallpaperengine src/wallpaper/2d/camera/parallax.cpp

@@ -46,7 +46,7 @@ const { parseScene, recomposeWorld, collectTransformDirty } = await import(path.
 const { ParticleSystem } = await import(path.join(ROOT, 'renderer/vendor/we-scene/render/particles.js'))
 const { WE_SHADER_HEADERS } = await imp('renderer/vendor/we-scene/headers.ts')
 
-const { mat4Identity, mat4Translate, mat4RotateZ, mat4Scale, mat4TransformPoint, mat4Invert, fitWindow, parallaxDepthFactor } = mathMod
+const { mat4Identity, mat4Translate, mat4RotateZ, mat4Scale, mat4TransformPoint, mat4Invert, fitWindow, parallaxDepthFactor, letterboxBands } = mathMod
 
 // ALIGN 与渲染器保持单一真源
 const { ALIGN, effectFboSize } = await import(path.join(ROOT, 'renderer/vendor/we-scene/render/renderer.js'))
@@ -459,6 +459,39 @@ console.log('\n【2. 屏幕→世界换算】')
       bad++
     } else if (Math.abs(contain16.viewW - 5120) > 1e-6) {
       fail(`32:9 contain 应看到整宽 5120，实得 ${contain16.viewW}`)
+      bad++
+    }
+    // contain 的 letterbox 遮罩（renderer.js 帧末把设计矩形之外盖回 clearColor）：
+    // 32:9 场景 16:9 窗口 → view 5120×2880，设计矩形 5120×1440 居中
+    // ⇒ 1600×900 画布上下各 225px 黑边、左右无黑边。这条判据锁的是
+    // 「设计矩形之外的层内容不得出现在最终画面」——3264246690 的人物网格
+    // y 到 2059（设计高只有 1440），修前双腿直接画进下黑边，用户报
+    // 「适配完整显示时人物后面的图层比例不对」。
+    const cb = letterboxBands(contain16.viewW, contain16.viewH, contain16.offX, contain16.offY, 5120, 1440, 1600, 900)
+    if (cb.length !== 2) {
+      fail(`32:9 contain 16:9 应恰好 2 条黑边（上下各 225px），实得 ${cb.length} 条：${JSON.stringify(cb)}`)
+      bad++
+    } else {
+      const [top, bottom] = cb
+      // 顶部带：GL viewport 原点在左下 ⇒ (0, height-y0, width, y0) = (0,675,1600,225)
+      if (top[0] !== 0 || Math.abs(top[1] - 675) > 1e-6 || top[2] !== 1600 || Math.abs(top[3] - 225) > 1e-6) {
+        fail(`32:9 contain 顶部黑边应为 (0,675,1600,225)，实得 ${JSON.stringify(top)}`)
+        bad++
+      }
+      if (bottom[0] !== 0 || bottom[1] !== 0 || bottom[2] !== 1600 || Math.abs(bottom[3] - 225) > 1e-6) {
+        fail(`32:9 contain 底部黑边应为 (0,0,1600,225)，实得 ${JSON.stringify(bottom)}`)
+        bad++
+      }
+    }
+    // cover / stretch / 设计比例窗口的 contain 都不该有黑边：
+    // cover 的 peek 溢出取景不能被遮掉，stretch 视窗本就等于设计矩形。
+    const coverBands = letterboxBands(cover16.viewW, cover16.viewH, cover16.offX, cover16.offY, 5120, 1440, 1600, 900)
+    const stretch16 = fitWindow('stretch', pW, pH, 1600, 900)
+    const stretchBands = letterboxBands(stretch16.viewW, stretch16.viewH, stretch16.offX, stretch16.offY, 5120, 1440, 1600, 900)
+    const sameAspect = fitWindow('contain', 5120, 1440, 1600, 450)
+    const sameAspectBands = letterboxBands(sameAspect.viewW, sameAspect.viewH, sameAspect.offX, sameAspect.offY, 5120, 1440, 1600, 450)
+    if (coverBands.length || stretchBands.length || sameAspectBands.length) {
+      fail(`cover/stretch/同比例 contain 不应有 letterbox 黑边（cover ${coverBands.length} / stretch ${stretchBands.length} / 同比例 ${sameAspectBands.length}）`)
       bad++
     }
     // 16:9 场景在 16:9 窗口：contain 与 cover 窗口应接近（测试台锁 16:9 时切 contain 几乎没变化）

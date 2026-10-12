@@ -16,6 +16,7 @@
  *   G. 变异红测：把权限门控 / 启用判断 / 整包原子性改坏，确认对应判据变红。
  */
 import { build } from "esbuild";
+import { glslModule, minifyGlsl, normalizeTail, isPrefixBlock, withHeaderComments } from "./lib/glsl-plugin.mjs";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
@@ -47,8 +48,23 @@ export * as pipeline from "./editor/export-pipeline.ts";
 export * as core from "./editor/core/index.ts";
 `;
 
+const glslLoader = {
+  name: "glsl-text",
+  setup(b) {
+    b.onLoad({ filter: /\.glsl$/ }, (a) => ({
+      contents: (() => {
+        const raw = fs.readFileSync(a.path, "utf8");
+        let code = minifyGlsl(raw);
+        if (isPrefixBlock(a.path) && a.path.endsWith(".head.glsl")) code = withHeaderComments(code, raw);
+        return glslModule(normalizeTail(code, isPrefixBlock(a.path)));
+      })(),
+      loader: "js",
+    }));
+  },
+};
+
 async function bundle(entry, platform, overrides = {}) {
-  const plugins = [
+  const plugins = [glslLoader,
     {
       name: "editor-api",
       setup(b) {

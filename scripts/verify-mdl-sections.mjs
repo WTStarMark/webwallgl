@@ -12,7 +12,18 @@
  * 特别注意 MDAT 是 **`MDA`** 前缀（不是 MDL）：按 MDL 筛选会整块漏掉附着点表，
  * 所以判据里对 MDAT 单独留了一条语料级断言。
  *
- * 语料缺失（本机没装壁纸库）时跳过而非失败：与其它 verifier 同策略。
+ * 语料缺失（本机没装壁纸库）时跳过语料段而非失败：与其它 verifier 同策略。
+ * 但**合成夹具段（〇）不读壁纸库**，无论有没有语料都照跑、失败即失败 —— 否则
+ * masks 段（ver > 21）这种「语料里没有独立样本」的行为在开发机上永远无人看管。
+ *
+ *   node scripts/verify-mdl-sections.mjs          合成段 + 语料段（默认）
+ *   node scripts/verify-mdl-sections.mjs --quick  只跑合成段（不碰壁纸库）
+ *
+ * 默认会读 `~/Library/Application Support/io.github.oneincase.wallpaperem/wallpapers`
+ * 下 13 个 item 的 scene.pkg，实测约 **250 个 .mdl / 382MB**。只跑合成段（隔离被禁
+ * 路径、或在多人并发时降内存）用 `--quick`，或用既有环境变量口子：
+ *   WE_LIBRARY=/nonexistent node scripts/verify-mdl-sections.mjs   # 与 --quick 等效
+ * 跳过语料段时**仍退出码 0**并显著标出，只有断言失败才非 0。
  */
 import fs from "node:fs";
 import { join } from "node:path";
@@ -20,6 +31,9 @@ import { pathToFileURL } from "node:url";
 import { LIB, ROOT, itemDir, createChecker } from "./lib/verify-kit.mjs";
 
 const { check, errors } = createChecker({ echo: true });
+
+/** `--quick`：跳过语料段（不读壁纸库），只跑合成夹具段。与 `WE_LIBRARY=/nonexistent` 等效。 */
+const QUICK = process.argv.includes("--quick");
 
 /** 含 puppet / 真 3D 网格的壁纸（MDL 解析的覆盖面：蒙皮、附着点、静止姿势、真网格） */
 const ITEMS = process.env.WE_MDL_ITEMS
@@ -60,6 +74,7 @@ function refFind(buf, sig) {
 const mdlMath = await import(pathToFileURL(join(ROOT, "renderer/vendor/we-scene/render/mdl-math.js")).href);
 const mdlParse = await import(pathToFileURL(join(ROOT, "renderer/vendor/we-scene/render/mdl-parse.js")).href);
 const container = await import(pathToFileURL(join(ROOT, "renderer/vendor/we-scene/pkg/container.js")).href);
+const mdlWrite = await import(pathToFileURL(join(ROOT, "renderer/vendor/we-scene/pkg/mdl-write.js")).href);
 
 const SIGS = ["MDAT", "MDLS", "MDLA", "MDLE"];
 let used = 0;
@@ -72,7 +87,11 @@ let parsedAtt = 0;
 let refMs = 0;
 let prodMs = 0;
 
-for (const id of ITEMS) {
+// 语料段：`--quick` 下把 item 列表置空 —— used 保持 0，下面的「提前退出」分支会打印
+// 「语料段已跳过：--quick」并只结算合成夹具段（跳过本身退出码 0，断言失败才非 0）。
+const CORPUS_ITEMS = QUICK ? [] : ITEMS;
+
+for (const id of CORPUS_ITEMS) {
   const pkgPath = join(itemDir(id), "scene.pkg");
   if (!fs.existsSync(pkgPath)) continue;
   used++;
@@ -113,9 +132,288 @@ for (const id of ITEMS) {
   if (itemFiles) console.log(`  ${id}: ${itemFiles} 个 .mdl  ✓ 段偏移与参考扫描逐位一致`);
 }
 
+// ════════════════════════════════════════════════════════════════════════════
+// 〇、合成夹具：masks 段消费后的**游标精确推进** + 未知块（含 MDMP）不静默错位
+//    （2026-10-12，G5/M4）不读壁纸库 ⇒ 语料缺失（used === 0）的机器上也照跑，
+//    所以**必须插在下面那个提前退出之前**。
+//
+//    为什么合成：语料里 ver > 21 的 masks 段没有独立样本，而且本机可能根本没装库。
+//    判据全部由本文件独立构造 —— 夹具自己写字节、自己按布局公式算期望偏移，
+//    与生产读/写实现零共享代码（不 import Writer，也不调用 meshVertexLayout）。
+// ════════════════════════════════════════════════════════════════════════════
+
+/** 夹具专用小端写入器（刻意不复用 pkg/mdl-write.js 的 Writer） */
+class FixWriter {
+  constructor() {
+    this.b = [];
+  }
+  u8(v) {
+    this.b.push(v & 255);
+    return this;
+  }
+  u16(v) {
+    this.b.push(v & 255, (v >>> 8) & 255);
+    return this;
+  }
+  u32(v) {
+    this.b.push(v & 255, (v >>> 8) & 255, (v >>> 16) & 255, (v >>> 24) & 255);
+    return this;
+  }
+  f32(v) {
+    const d = new DataView(new ArrayBuffer(4));
+    d.setFloat32(0, v, true);
+    for (let i = 0; i < 4; i++) this.b.push(d.getUint8(i));
+    return this;
+  }
+  ascii(s) {
+    for (let i = 0; i < s.length; i++) this.b.push(s.charCodeAt(i) & 255);
+    return this;
+  }
+  cstr(s) {
+    return this.ascii(s).u8(0);
+  }
+  zeros(n) {
+    for (let i = 0; i < n; i++) this.b.push(0);
+    return this;
+  }
+  get len() {
+    return this.b.length;
+  }
+  done() {
+    return new Uint8Array(this.b);
+  }
+}
+
+/**
+ * 两种顶点布局，贴住生产实现的 LAYOUTS 表（不是随手挑的）：
+ *  · static48 —— meshFlag 0xf，stride 48：pos@0 / normal@12 / tangent@24(16B) / uv@40。
+ *    只对 MDLV0023 成立（ver < 23 的候选表里根本没有 48）。
+ *  · skin80 —— meshFlag 0x0180000e，stride 80：pos@0 / normal@12 / tangent@24(16B) /
+ *    骨 4 索引@40(16B) / 4 权重@56(16B，和必须为 1) / uv@72。
+ *    ver < 23 的候选表只有 52(lenOff 8/4) 与 80(lenOff 32) 两种 stride，所以不含 masks
+ *    的对照组（ver = 21）必须用 80：`{lenOff:32, stride:80, uv:72, bone:40, weight:56}`。
+ */
+const LAYOUT_STATIC48 = { stride: 48, meshFlag: 0xf, uv: 40 };
+const LAYOUT_SKIN80 = { stride: 80, meshFlag: 0x0180000e, uv: 72 };
+
+function fixVertex(w, layout, x, y) {
+  w.f32(x).f32(y).f32(0); // pos@0
+  w.f32(0).f32(1).f32(0); // normal@12（单位向量）
+  w.f32(1).f32(0).f32(0).f32(0); // tangent@24（vec4）
+  if (layout.stride === 80) {
+    for (let k = 0; k < 4; k++) w.u32(0); // 骨索引@40（夹具里 4 个槽都用 0 号骨）
+    for (let k = 0; k < 4; k++) w.f32(0.25); // 权重@56：和恰为 1（自洽校验会查）
+  }
+  w.f32(0.25).f32(0.75); // uv@layout.uv
+}
+
+const FIX_VERTS_A = [
+  [0, 0],
+  [1, 0],
+  [0, 1],
+  [1, 1],
+];
+const FIX_VERTS_B = [
+  [100, 0],
+  [101, 0],
+  [100, 1],
+  [101, 1],
+];
+
+/** masks 段的两个样本（变长 a/b 数组 —— 长度写错就会被游标抓住） */
+const FIX_MASKS = [
+  { tag: 1, json: '{"a":1}', a: [0, 0, 0], b: [0] },
+  { tag: 2, json: '{"b":22}', a: [0], b: [0, 0] },
+];
+
+function fixHeader(w, { ver, mdlFlag, skinCount, meshCount }) {
+  w.ascii("MDLV" + String(ver).padStart(4, "0"));
+  w.u8(0).u32(mdlFlag).u32(skinCount).u32(meshCount);
+}
+
+/**
+ * 追加一条网格记录。`dropMaskPayload` 只为负对照：声明 maskCount 但不写载荷。
+ * 返回本条网格材质串的起始偏移（= 夹具自己记录的真值）。
+ */
+function fixMesh(w, { ver, layout, material, verts, masks = [], dropMaskPayload = false }) {
+  const anchor = w.len;
+  w.cstr(material);
+  w.u32(0); // flagA = 0（≠2 ⇒ 无额外字段）
+  if (ver >= 17) for (const v of [-1, -1, -1, 1, 1, 1]) w.f32(v); // AABB
+  if (ver > 14) w.u32(layout.meshFlag); // meshFlag：决定 stride 与字段偏移
+  w.u32(verts.length * layout.stride); // vertexBytes
+  for (const [x, y] of verts) fixVertex(w, layout, x, y);
+  w.u32(6 * 2); // indexBytes
+  for (const i of [0, 1, 2, 0, 1, 2]) w.u16(i);
+  if (ver >= 21) {
+    w.u8(0); // unkA = 0
+    w.u8(0); // hasParts = 0
+  }
+  if (ver > 21) {
+    w.u32(masks.length); // maskCount
+    if (!dropMaskPayload) {
+      for (const m of masks) {
+        w.u32(m.tag).u32(0); // 固定 8 字节，生产实现整体跳过
+        w.cstr(m.json); // 材质 json
+        w.u32(0); // json 之后固定 4 字节
+        w.u32(m.a.length);
+        for (const v of m.a) w.u32(v);
+        w.u32(m.b.length);
+        for (const v of m.b) w.u32(v);
+      }
+    }
+  }
+  return anchor;
+}
+
+/**
+ * 独立复算第二条网格的起始偏移 —— 依据是 mdl 文档里的布局公式，不是生产代码。
+ * masks 段按「每个 mask 的实际长度」逐字节累加（这正是游标必须精确的那一段）。
+ */
+function expectedSecondMeshOffset(ver, mat0, masks, stride) {
+  let p = 0x15;
+  p += mat0.length + 1; // 材质 cstr
+  p += 4; // flagA
+  if (ver >= 17) p += 24; // AABB
+  if (ver > 14) p += 4; // meshFlag
+  p += 4 + 4 * stride; // vertexBytes + 顶点
+  p += 4 + 6 * 2; // indexBytes + 索引
+  if (ver >= 21) p += 2; // unkA + hasParts
+  if (ver > 21) {
+    p += 4; // maskCount
+    for (const m of masks) p += 8 + (m.json.length + 1) + 4 + (4 + m.a.length * 4) + (4 + m.b.length * 4);
+  }
+  return p;
+}
+
+const MAT0 = "m0.mdl.material.json";
+const MAT1 = "m1.mdl.material.json";
+
+/** 两网格夹具：ver 23 = 静态 48B 顶点 + masks 段；ver 21 = 蒙皮 80B 顶点 + 无 masks 字段 */
+function buildTwoMeshFixture(ver) {
+  const layout = ver > 21 ? LAYOUT_STATIC48 : LAYOUT_SKIN80;
+  const masks = ver > 21 ? FIX_MASKS : [];
+  const w = new FixWriter();
+  fixHeader(w, { ver, mdlFlag: 0x01800009, skinCount: 1, meshCount: 2 });
+  fixMesh(w, { ver, layout, material: MAT0, verts: FIX_VERTS_A, masks });
+  const anchor1 = fixMesh(w, { ver, layout, material: MAT1, verts: FIX_VERTS_B, masks: [] });
+  return { buf: w.done(), anchor1, layout, masks };
+}
+
+function parseOrNull(buf) {
+  try {
+    return mdlParse.parseMDL(buf);
+  } catch (e) {
+    return { __threw: String((e && e.message) || e) };
+  }
+}
+
+for (const ver of [23, 21]) {
+  const label = `合成夹具 MDLV00${ver}（${ver > 21 ? "含 masks 段 / stride 48" : "无 masks 字段 / stride 80"}）`;
+  const f = buildTwoMeshFixture(ver);
+  // 夹具自检：写入器实际落点 == 独立公式算出的落点（夹具本身错了就没资格当判据）
+  const want = expectedSecondMeshOffset(ver, MAT0, f.masks, f.layout.stride);
+  check(f.anchor1 === want, `${label}: 夹具自检失败 —— mesh1 实际起点 ${f.anchor1} ≠ 公式 ${want}`);
+  const mdl = parseOrNull(f.buf);
+  check(!mdl.__threw, `${label}: parseMDL 抛异常 ${mdl.__threw}`);
+  const ms = mdl && mdl.meshes;
+  check(!!ms && ms.length === 2, `${label}: 应解析出 2 条子网格（拿到 ${ms ? ms.length : "null"}）`);
+  if (ms && ms.length === 2) {
+    check(ms[0].materialPath === MAT0, `${label}: mesh0 材质串 = ${ms[0].materialPath}（期望 ${MAT0}）`);
+    // ↓ 这条就是「masks 段消费后游标精确落在下一条网格开头」的判据
+    check(ms[1].materialPath === MAT1, `${label}: mesh1 材质串 = ${ms[1].materialPath}（期望 ${MAT1}，游标错位就抓在这里）`);
+    // positions 是扁平数组、**每顶点 3 个分量**：四个顶点的 x 应依次是 100 / 101 / 100 / 101
+    const xs = [0, 3, 6, 9].map((i) => ms[1].positions[i]).join(",");
+    check(
+      xs === "100,101,100,101",
+      `${label}: mesh1 顶点被错位解读（四个顶点的 x = ${xs}，期望 100,101,100,101）`,
+    );
+    check(ms[1].vertexCount === 4, `${label}: mesh1 顶点数 = ${ms[1].vertexCount}（期望 4）`);
+    check(ms[1].indices.length === 6, `${label}: mesh1 索引数 = ${ms[1].indices.length}（期望 6）`);
+  }
+}
+
+// 负对照：声明了 maskCount 却不写载荷 —— 生产实现必须**不能**给出正确的 mesh1。
+// 若某次改动改成「忽略 masks 段、直接往下走」，这条会立刻变红（判据有鉴别力）。
+{
+  const w = new FixWriter();
+  fixHeader(w, { ver: 23, mdlFlag: 0x01800009, skinCount: 1, meshCount: 2 });
+  fixMesh(w, { ver: 23, layout: LAYOUT_STATIC48, material: MAT0, verts: FIX_VERTS_A, masks: FIX_MASKS, dropMaskPayload: true });
+  fixMesh(w, { ver: 23, layout: LAYOUT_STATIC48, material: MAT1, verts: FIX_VERTS_B, masks: [] });
+  const bad = parseOrNull(w.done());
+  const silentlyRight =
+    !bad.__threw && bad.meshes && bad.meshes.length === 2 && bad.meshes[1].positions[0] === 100;
+  check(
+    !silentlyRight,
+    "负对照：masks 载荷缺失时仍「静默」解析出正确的 mesh1 —— masks 段判据没有鉴别力",
+  );
+}
+
+/**
+ * 未知块夹具：网格之后依次是 `MDMP0001`（不在 SECTION_TYPES 里）与合法 `MDAT0001`。
+ * 期望：MDMP 整块落进 gap、段表只剩结构化 MDAT、写回逐字节相等且偏移不变。
+ */
+function buildUnknownBlockFixture() {
+  const w = new FixWriter();
+  fixHeader(w, { ver: 23, mdlFlag: 0x01800009, skinCount: 1, meshCount: 1 });
+  fixMesh(w, { ver: 23, layout: LAYOUT_STATIC48, material: MAT0, verts: FIX_VERTS_A, masks: [] });
+  const mdmpAt = w.len;
+  w.ascii("MDMP0001").u8(7).u32(0xdeadbeef).u32(3).zeros(12); // 未知块：形态刻意与已知段接近
+  const mdmpBytes = w.len - mdmpAt;
+  const mdatAt = w.len;
+  w.ascii("MDAT0001").u8(0).u32(mdatAt + 84).u16(1); // nextOff = 段尾（夹具自己算绝对值）
+  w.u16(0).cstr("b0"); // 附着点：骨号 0 + 名字
+  for (let i = 0; i < 16; i++) w.f32(i % 5 === 0 ? 1 : 0); // 16×f32 单位阵
+  return { buf: w.done(), mdmpAt, mdmpBytes, mdatAt };
+}
+
+{
+  const f = buildUnknownBlockFixture();
+  const doc = (() => {
+    try {
+      return mdlWrite.readMdlDoc(f.buf);
+    } catch (e) {
+      check(false, `未知块夹具：readMdlDoc 抛异常 ${(e && e.message) || e}`);
+      return null;
+    }
+  })();
+  if (doc) {
+    check(!doc.raw, "未知块夹具：网格表应能走通（拿到的是 raw 兜底）");
+    check(!!doc.meshes && doc.meshes.length === 1, `未知块夹具：网格数 = ${doc.meshes && doc.meshes.length}（期望 1）`);
+    check(
+      doc.sections.length === 1 && doc.sections[0].type === "MDAT" && !doc.sections[0].raw,
+      `未知块夹具：段表应只有 1 条结构化 MDAT（拿到 ${doc.sections.length} 条：${doc.sections.map((s) => s.type + (s.raw ? "(raw)" : "")).join(",")}）`,
+    );
+    check(doc.gap.length === f.mdmpBytes, `未知块夹具：MDMP(${f.mdmpBytes}B) 应整块落进 gap（gap = ${doc.gap.length}B）`);
+    check(refFind(doc.gap, "MDMP0001") === 0, "未知块夹具：gap 起点应是 MDMP 签名");
+    check(doc.trailing.length === 0, `未知块夹具：trailing 应为空（拿到 ${doc.trailing.length}B）`);
+
+    const out = mdlWrite.writeMdlDoc(doc);
+    let diff = out.length === f.buf.length ? -1 : -2;
+    if (diff === -1) {
+      for (let i = 0; i < out.length; i++)
+        if (out[i] !== f.buf[i]) {
+          diff = i;
+          break;
+        }
+    }
+    check(diff === -1, `未知块夹具：写回必须逐字节相等（长度 ${out.length} vs ${f.buf.length}，首个不同 @${diff}）`);
+    const at = refFind(out, "MDMP0001");
+    check(at === f.mdmpAt, `未知块夹具：写回后 MDMP 绝对偏移 ${at} ≠ 原 ${f.mdmpAt}（未知块被静默移位）`);
+    check(refFind(out, "MDAT0001") === f.mdatAt, `未知块夹具：写回后 MDAT 绝对偏移 ${refFind(out, "MDAT0001")} ≠ 原 ${f.mdatAt}`);
+  }
+}
+
 if (used === 0) {
-  console.log(`\nverify-mdl-sections: 跳过（本机壁纸库里没有样本：${LIB}）`);
-  process.exit(0);
+  // 跳过语料段**不是失败**（退出码仍 0），但要在输出里显著标出，别让人把「没读语料」
+  // 误当成「语料全绿」。只有断言真的失败才非 0。
+  console.log(
+    QUICK
+      ? "\n⚠ 语料段已跳过（--quick）：只跑了合成夹具段，未读壁纸库"
+      : `\n⚠ 语料段已跳过（本机壁纸库里没有样本：${LIB}）`,
+  );
+  console.log(errors.length === 0 ? "verify-mdl-sections 合成夹具段: 全部通过 ✓" : `verify-mdl-sections 合成夹具段: ${errors.length} 项失败 ✗`);
+  process.exit(errors.length === 0 ? 0 : 1);
 }
 
 check(files > 0, `语料里必须真的出现 .mdl（拿到 ${files} 个）`);

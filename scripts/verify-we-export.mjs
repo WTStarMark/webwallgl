@@ -10,6 +10,7 @@
  *   E. 变异红测：把校验器 / 管线改坏，确认对应判据变红。
  */
 import { build } from "esbuild";
+import { glslModule, minifyGlsl, normalizeTail, isPrefixBlock, withHeaderComments } from "./lib/glsl-plugin.mjs";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
@@ -34,8 +35,23 @@ export * as shaderLib from "./editor/shader-lib.ts";
 export { checkWeCompat } from "./renderer/src/editor/compat.ts";
 `;
 
+const glslLoader = {
+  name: "glsl-text",
+  setup(b) {
+    b.onLoad({ filter: /\.glsl$/ }, (a) => ({
+      contents: (() => {
+        const raw = fs.readFileSync(a.path, "utf8");
+        let code = minifyGlsl(raw);
+        if (isPrefixBlock(a.path) && a.path.endsWith(".head.glsl")) code = withHeaderComments(code, raw);
+        return glslModule(normalizeTail(code, isPrefixBlock(a.path)));
+      })(),
+      loader: "js",
+    }));
+  },
+};
+
 async function load(overrides = {}) {
-  const plugins = [
+  const plugins = [glslLoader,
     {
       name: "editor-api",
       setup(b) {

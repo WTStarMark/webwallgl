@@ -31,7 +31,7 @@
  * 退出码非 0 表示发现问题。
  */
 import fs from "node:fs";
-import { join } from "node:path";
+import { join, relative, sep } from "node:path";
 
 import { LIB, ROOT, imp, createChecker, dec } from "./lib/verify-kit.mjs";
 const { parsePkg, getEntry } = await imp("renderer/vendor/we-scene/pkg/container.js");
@@ -581,13 +581,25 @@ const ids = fs.existsSync(LIB)
 // ---------- 11. 场景环境光：材质 LIGHTING combo → 图层基色乘有效环境光 ----------
 //
 // 官方 genericimage2/3/4（genericparticle 另有 DOUBLESIDEDLIGHTING）在
-// `#if LIGHTING` 时 ambient = g_LightAmbientColor*albedo，无直射灯（本仓不跑
-// PBR）时结果 = albedo × g_LightAmbientColor。
-// **g_LightAmbientColor = min(1, ambientcolor×π)**（2026-09-18 实测标定，
+// `#if LIGHTING` 时的结果 = **环境光 + 4 盏灯的直射光**：
+//   ambient = max(vec3(0.001), g_LightAmbientColor) × albedo         ← 本节
+//   light   = Σ 灯 (diffuse·albedo/π + specular) × radiance × max(dot(N,L),0)
+//             （radiance 两代衰减见第 12 节）                        ← 第 12 节
+//   c.rgb   = CombineLighting(light, ambient)（HDR 时对 >2 的部分加权）
+// `g_LightAmbientColor = min(1, ambientcolor×π)`（2026-09-18 实测标定，
 // 3737267090「整体太黑」：raw 0.3 直乘压暗 70%；详见 CASEBOOK「环境光 π 标定」）。
-// 直射光那一半见第 12 节（2026-09-24 起场景灯光对象已接线）。
-// 语料锁：LIGHTING=1 的 genericimage* pass（2026-09-18 本机库 8 pass / 4 张：
-// 2894296965×4 / 3737267090×2 / 3047405322×1 / 3509243656×1），数量变了要人看一眼；
+//
+// **2026-10-12 修正**：本节早先写成「无直射灯（本仓不跑 PBR）」，那是 2026-09-24
+// 接线**之前**的结论，现已不成立 —— 场景灯光对象已接线，图片层走
+// renderer-glsl.js 的 COPY_LIT_FRAG（直射光那一半），本节只负责环境光那一半。
+// 判据见 scripts/verify-props.mjs 第 12 节（形状/几何/通道/台账）+ 第 15 节
+// （实际数值非零的正例夹具）；口径与 renderer/vendor/we-scene/headers.ts:398-418
+// 的实现描述一致（那里同时提醒：`PerformLighting_V1` 只覆盖**效果 pass** 那条路，
+// 那条路上直射项仍是 0，别按它判断整库直射光）。
+//
+// 环境光侧的证据：环境光是**乘子**（layerColorAmbient）、纯函数，故数值判据在这一节；
+// 直射光是**在着色器里求值的**，故数值判据在第 12 节（形状）与第 15 节（合成夹具）。
+// 语料锁：台账见下方 2026-10-06 更新（57 pass / 14 张），数量变了要人看一眼；
 // 这条断言同时守住「不要给未开光照的材质全局压暗」的回归红线。
 {
   const renderer = await imp("renderer/vendor/we-scene/render/renderer.js");
@@ -655,8 +667,8 @@ const ids = fs.existsSync(LIB)
 
 // ---------- 12. 场景灯光对象 → LIGHTING 材质的直射光 ----------
 //
-// **两条通道 × 两代衰减**（2026-09-24 定性；官方 shader 明文 + Waple 对
-// wallpaper64.exe 的逆向 `docs/re/scene-lighting.md` 互证，详见 renderer.js
+// **两条通道 × 两代衰减**（2026-09-24 定性；官方 shader 明文与本地语料统计
+// 互证，详见 renderer.js
 // 顶部的灯光通道注释与 renderer-glsl.js 的 lightRadiance）：
 //   - `l*` 前缀（lpoint/lspot/ltube/ldirectional）→ **V1 通道**：
 //     `g_LPoint_Color.rgb = color×intensity`、`.w = radius`、`g_LPoint_Origin.w = exponent`，
@@ -678,7 +690,7 @@ const ids = fs.existsSync(LIB)
 
   // (a) V1 通道打包：色 = color×intensity（**不预乘 radius²** —— 那是老通道的
   //     g_LightsColorPremultiplied），radius/exponent 各自随槽走、缺省 1000/2
-  //     （官方 LightObject 注册默认，Waple §1.3）。
+  //     （官方 LightObject 注册默认，本地语料统计一致）。
   const c1 = renderer.lightColorIntensity({ color: [1, 0.97647, 0.91765], intensity: 1.79 });
   if (!near3(c1, [1.79, 1.7479, 1.6426], 1e-4))
     fail(`V1 颜色槽应为 color×intensity（3737267090 灯 = [1.79,1.748,1.643]），实得 ${c1.map((v) => v.toFixed(4))}`);
@@ -993,6 +1005,364 @@ const ids = fs.existsSync(LIB)
     fail("collectSceneLights 未产出纯颜色表（F39）");
   }
   if (!errors.length) ok("老通道两份 light uniform 口径正确（ColorRadius=纯色 / Premultiplied=色×强度×r²，F39）");
+}
+
+// ---------- 14. 灯光阴影/体积字段：**只解析不渲染**（D2，2026-10-12 用户拍板）----------
+//
+// 决策：`castshadow` / `cascadedistance0|1|2` / `density` / `volumetricsexponent` /
+// `castvolumetrics` / `innercone` / `outercone` / `cookie` / `usecookie` /
+// `lightsourcesize`（以及 `general.lightconfig` 的 `pointshadow` / `directionalshadow`
+// / `spotcookie` 子开关）**只进解析结果**：不做阴影图集、不做体积光 RT、不新增任何
+// uniform/program/draw/pass/RT。
+//
+// 解析侧：`scene/parse.js` 的 `readLightNum()` + 灯对象上的 `lightParams` 块，
+// 以及 `general.lightconfig` → `scene.lightconfig`。**只有灯对象带 lightParams**
+// （非灯对象为 null：非灯对象上的 `castshadow` 是文字层投影开关，走 `textCastshadow`）。
+//
+// 本节把上一条决策**钉成判据**，两道锁：
+//   ① 合成 scene JSON（进程内构造，不读素材库）：字段被解析、缺省值正确、非法值不崩；
+//   ② 重扫真实源码：这些字段名**没有**出现在任何渲染路径（uniform/program/draw/pass
+//      /RT），也没有出现在任何非 parse.js 的源码里 —— 后人想接上就会在这里翻红。
+//
+// 三类既有消费的**例外**必须先说清（否则判据要么误报、要么留洞）：
+//   · `castshadow`：`parse.js` 的 `textCastshadow`（文字层投影开关）已消费，
+//     `editor/objprops.ts:57` 也注册为 `only:"text"`；本节断的是「灯对象上的
+//     `castshadow` 没有除 lightParams 之外的消费者」。
+//   · `exponent` / `parent` / `parallaxDepth` / `solid` / `visible`：**本来就有**真实
+//     消费者（衰减指数 / 层级链接 / 视差 / 纯色层 / 可见性），不属于本次「只解析」的
+//     新字段 —— 所以 `exponent` 复用既有 `lightExponent`（不另立键），`parent`
+//     复用既有 `parentId`，绝不新造第二个键。
+//   · `general.lightconfig` 整体：`renderer.js:447-448,507` 只有注释提到它、
+//     `scene-mount.ts:4619` 读的是**兄弟开关** `lightconfig.directional`（方向光总
+//     开关，与本次解析的三个子开关不同），本节不断言「lightconfig 全无消费者」。
+{
+  const { parseScene: psScene } = await imp("renderer/vendor/we-scene/scene/parse.js");
+  // 合成 scene.json（不读素材库）：只放解析器需要的键
+  const mkScene = (obj, lightcfg) => ({
+    camera: { eye: "0 0 0", center: "0 0 -1", up: "0 1 0" },
+    general: { clearcolor: "0 0 0", ...(lightcfg ? { lightconfig: lightcfg } : {}) },
+    objects: [obj],
+  });
+  const lightBase = { id: 1, name: "L", light: "lspot", origin: "10 20 30", color: "1 1 1", radius: 2048, intensity: 1, exponent: 4 };
+  // `general.lightconfig` 的子开关（槽位数，不是布尔）——放在 general 里，别塞进 project
+  const sceneLightCfg = (pointshadow, directionalshadow, spotcookie) => ({ pointshadow, directionalshadow, spotcookie });
+
+  // ① 缺省值（逐字段的类型 + 官方缺省，表见 scene/parse.js 的 lightParams 注释）
+  const sDef = psScene(mkScene(lightBase), {});
+  const lp = sDef.layers[0] && sDef.layers[0].lightParams;
+  if (!lp) fail("灯对象应解析出 lightParams（只解析不渲染的那组阴影/体积字段）");
+  else {
+    const expectNum = {
+      cascadeDistance: 0, cascadeDistance1: 0, cascadeDistance2: 0,
+      density: 1, volumetricsExponent: 1, innerCone: 0, outerCone: 0, sourceSize: 0,
+    };
+    for (const [k, v] of Object.entries(expectNum)) {
+      if (typeof lp[k] !== "number" || !Number.isFinite(lp[k]))
+        fail(`lightParams.${k} 应是 number（实得 ${typeof lp[k]} = ${lp[k]}）`);
+      else if (Math.abs(lp[k] - v) > 1e-9) fail(`lightParams.${k} 缺省应为 ${v}，实得 ${lp[k]}`);
+    }
+    const expectBool = { castshadow: false, castVolumetrics: false, cookieEnabled: false };
+    for (const [k, v] of Object.entries(expectBool)) {
+      if (typeof lp[k] !== "boolean") fail(`lightParams.${k} 应是 boolean（实得 ${typeof lp[k]} = ${lp[k]}）`);
+      else if (lp[k] !== v) fail(`lightParams.${k} 缺省应为 ${v}，实得 ${lp[k]}`);
+    }
+    if (typeof lp.cookie !== "string" || lp.cookie !== "")
+      fail(`lightParams.cookie 应是 string（缺省空串 = 无 cookie），实得 ${typeof lp.cookie} ${JSON.stringify(lp.cookie)}`);
+  }
+
+  // ② 给了值要照读（含 `{value:<快照>}` 脚本/用户属性包装）
+  const sGiven = psScene(mkScene({
+    ...lightBase,
+    castshadow: true, cascadedistance0: 5, cascadedistance1: 7, cascadedistance2: 9,
+    density: 0.25, volumetricsexponent: 3, castvolumetrics: true,
+    innercone: 0.2, outercone: 0.5, cookie: "cookies/spot1", usecookie: true, lightsourcesize: 7,
+  }, sceneLightCfg(0, 2, 1)), {});
+  const gp = sGiven.layers[0].lightParams;
+  const given = {
+    castshadow: true, cascadeDistance: 5, cascadeDistance1: 7, cascadeDistance2: 9,
+    density: 0.25, volumetricsExponent: 3, castVolumetrics: true,
+    innerCone: 0.2, outerCone: 0.5, cookie: "cookies/spot1", cookieEnabled: true, sourceSize: 7,
+  };
+  for (const [k, v] of Object.entries(given)) {
+    if (gp[k] !== v) fail(`lightParams.${k} 应照读作者值 ${JSON.stringify(v)}，实得 ${JSON.stringify(gp[k])}`);
+  }
+  for (const [k, v] of Object.entries({ pointshadow: 0, directionalshadow: 2, spotcookie: 1 })) {
+    if (sGiven.lightconfig[k] !== v)
+      fail(`scene.lightconfig.${k} 应照读 ${v}（槽位数，不是布尔），实得 ${JSON.stringify(sGiven.lightconfig[k])}`);
+  }
+
+  // ③ 非法值不崩、退回缺省（数字串照读、"nope" 退缺省、包装里的串退缺省、null 退缺省）
+  let sBad = null;
+  try {
+    sBad = psScene(mkScene({
+      ...lightBase,
+      castshadow: "yes",               // 字符串 → parseBool 返回缺省 false（不是「非空即真」）
+      cascadedistance0: "nope",        // 非数字串 → 缺省
+      density: null,                   // null → 缺省
+      volumetricsexponent: { value: "z" }, // 包装里的非数字 → 缺省
+      castvolumetrics: 1,              // 数字 1 → 真（slider 当开关的既有语义）
+      innercone: { value: 0.2 },       // 包装取快照
+      outercone: { value: "x" },       // 包装里的非数字 → 缺省
+      cookie: { value: "tex/spot" },   // 包装取快照
+      usecookie: 0,                    // 0 → 假
+      lightsourcesize: { value: 2.5 }, // 包装取快照
+    }, sceneLightCfg("x", undefined, null)), {});
+  } catch (e) {
+    fail(`非法灯光阴影/体积字段不得让 parseScene 抛错：${e.message}`);
+  }
+  if (sBad) {
+    const bp = sBad.layers[0].lightParams;
+    if (bp.cascadeDistance !== 0) fail(`"nope" 应退缺省 0，实得 ${bp.cascadeDistance}`);
+    if (bp.density !== 1) fail(`null 应退缺省 1，实得 ${bp.density}`);
+    if (bp.volumetricsExponent !== 1) fail(`包装里的非数字应退缺省 1，实得 ${bp.volumetricsExponent}`);
+    if (bp.outerCone !== 0) fail(`包装里的非数字应退缺省 0，实得 ${bp.outerCone}`);
+    if (bp.cookie !== "tex/spot") fail(`cookie 包装应取快照 "tex/spot"，实得 ${JSON.stringify(bp.cookie)}`);
+    if (bp.cookieEnabled !== false) fail(`usecookie:0 应解析为 false，实得 ${bp.cookieEnabled}`);
+    if (bp.sourceSize !== 2.5) fail(`lightsourcesize 包装应取 2.5，实得 ${bp.sourceSize}`);
+    if (bp.castshadow !== false) fail(`castshadow:"yes" 按既有 parseBool 语义（字符串落缺省）应为 false，实得 ${bp.castshadow}`);
+    if (bp.castVolumetrics !== true) fail(`castvolumetrics:1 应按 slider 语义为 true，实得 ${bp.castVolumetrics}`);
+    for (const [k, v] of Object.entries({ pointshadow: 1, directionalshadow: 1, spotcookie: 0 })) {
+      if (sBad.lightconfig[k] !== v) fail(`非法 lightconfig.${k} 应退缺省 ${v}，实得 ${sBad.lightconfig[k]}`);
+    }
+  }
+  // 非灯对象不得被塞 lightParams（文字层的 castshadow 走 textCastshadow，别混）
+  const sText = psScene(mkScene({ id: 1, name: "t", text: "hi", castshadow: true, density: 3 }), {});
+  if (sText.layers[0].lightParams !== null)
+    fail("非灯对象不该有 lightParams（文字层的 castshadow 是另一套：textCastshadow）");
+  if (sText.layers[0].textCastshadow !== true)
+    fail("文字层 castshadow 仍必须走 textCastshadow（别被本次改动挤掉）");
+
+  // ④ 「渲染侧未接线」：重扫真实源码（排除 .worktrees/.tmp，否则 17 份 worktree 副本会淹没结果）。
+  //
+  // 三条判断口径（**只看真实代码引用，不把注释当消费者** —— 注释正是这份决策的文档）：
+  //   A. `lightParams.<键>` 一旦被别的文件读到，就是「有人把它渲染侧接上了」⇒ 翻红；
+  //   B. 那 10 个**全仓零引用**的字段名出现在 parse.js 之外 ⇒ 翻红（它们连注释都没有）；
+  //   C. `castshadow` 的既有（文字层）消费者只允许出现在白名单文件里；另加 `lightShadow`
+  //      形态守卫，防「换个键名绕过去」。
+  //   检测器本身带**正向自检**：拿一段故意写错的合成文本喂进去必须被逮到 —— 否则
+  //   「零命中」既可能是真干净，也可能是检测器瞎了。
+  const SCAN_DIRS = ["renderer", "editor", "shared", "scripts", "render"];
+  const SKIP_DIRS = new Set(["node_modules", ".worktrees", ".tmp", "dist", ".git"]);
+  const walkSrc = (p, acc = []) => {
+    let ents = [];
+    try { ents = fs.readdirSync(p, { withFileTypes: true }); } catch { return acc; }
+    for (const e of ents) {
+      const q = join(p, e.name);
+      if (e.isDirectory()) { if (!SKIP_DIRS.has(e.name)) walkSrc(q, acc); }
+      else if (/\.(js|ts|mjs|cjs)$/.test(e.name)) acc.push(q);
+    }
+    return acc;
+  };
+  const srcFiles = SCAN_DIRS.flatMap((d) => walkSrc(join(ROOT, d)));
+  const PARSE_REL = "renderer/vendor/we-scene/scene/parse.js";
+  const SELF_REL = "scripts/verify-props.mjs";
+  // 判据脚本自身的豁免（与 SELF_REL 同理）：它们的**职责**就是逐字段断言 parse.js 的
+  // 「只解析」缺省表、并反向断言渲染侧零消费者，所以**按设计**要写出这些字段名。
+  // 判据脚本不是渲染代码 ⇒ 不构成「接上渲染侧」；对**其它一切文件**的消费者判定照旧生效。
+  const CONST_JUDGE_SELVES = new Set([
+    "scripts/verify-light-constants.mjs",
+    "scripts/verify-particle-constants.mjs",
+    "scripts/verify-tex-constants.mjs",
+    "scripts/verify-native-state.mjs",
+    "scripts/verify-scenescript-constants.mjs",
+    "scripts/verify-camera-constants.mjs",
+  ]);
+  // 守卫：豁免名单只允许「存在且形如 scripts/verify-*-constants.mjs」的判据脚本，
+  // 防止后人往这里塞一个渲染文件把这个检测器弄瞎。
+  for (const rel of CONST_JUDGE_SELVES) {
+    if (!/^scripts\/verify-[a-z-]+\.mjs$/.test(rel) || !fs.existsSync(join(ROOT, rel)))
+      fail(`「只解析不渲染」检测器的判据脚本豁免名单非法：${rel}`);
+  }
+  // 本次「只解析」的字段名。`castshadow` 的既有消费者（文字层）单独列在 KNOWN_TEXT。
+  const PARSE_ONLY = ["cascadedistance", "volumetricsexponent", "castvolumetrics",
+    "innercone", "outercone", "usecookie", "lightsourcesize", "pointshadow",
+    "directionalshadow", "spotcookie"];
+  // `castshadow` 的既有（文字层）消费者：只允许出现在这些文件里
+  const KNOWN_TEXT = new Set([
+    "renderer/vendor/we-scene/scene/parse.js",
+    "renderer/vendor/we-scene/render/text-layout.js",
+    "renderer/vendor/we-scene/render/text.js",
+    "renderer/src/scene-mount.ts",
+    "editor/objprops.ts",
+    "editor/i18n.ts",
+    "scripts/verify-text.mjs",
+    "scripts/verify-editor.mjs",
+  ]);
+  // 为什么只扫 `.js/.ts/.mjs/.cjs` 而不扫着色器文本：上面三条检查就是「渲染侧代码有没有读它」
+  // 的充分条件 —— 读不到值的字段不可能进 uniform；着色器侧另有第 12 节的形状断言兜住。
+  const violationsIn = (txt, r) => {
+    const out = [];
+    const lines = txt.split("\n");
+    const at = (re) => lines.findIndex((l) => re.test(l)) + 1;
+    if (r === PARSE_REL) return out; // 解析层是唯一允许出现这些字段名的地方
+    if (/lightParams\s*[.?\[\]"]/.test(txt))
+      out.push(`「只解析不渲染」被判据逮到：${r}:${at(/lightParams\s*[.?\[\]"]/)} 读了 lightParams —— 该字段组不得接任何 uniform/program/draw/pass/RT`);
+    for (const f of PARSE_ONLY) {
+      if (!txt.toLowerCase().includes(f)) continue;
+      out.push(`「只解析不渲染」判据被破坏：${f} 出现在渲染/外围源码 ${r}:${at(new RegExp(f, "i"))}（该字段不得接任何 uniform/program/draw/pass/RT）`);
+    }
+    if (/castshadow/i.test(txt) && !KNOWN_TEXT.has(r))
+      out.push(`castshadow 的既有消费者只有文字层（textCastshadow）；本仓新出现 ${r}:${at(/castshadow/i)}，请确认不是把灯 shadow 接上了`);
+    // 守卫：灯 shadow 的读取形态必须是 `lightParams.castshadow` —— 一旦有人换个读法，
+    // 上面 C 的名单就管不住它了（这条是防「改成 layer.lightShadow = ...」这类绕过）。
+    if (/\blightShadow\b/.test(txt))
+      out.push(`检出 ${r}:${at(/\blightShadow\b/)} 的 lightShadow 读取：灯 shadow 只能走 lightParams（只解析不渲染）`);
+    return out;
+  };
+  // 正向自检：一条假 uniform 绑定 —— 就是后人「顺手接上」会写成的样子。
+  // 用 renderer.js 当宿主文件（它不在 KNOWN_TEXT 里，所以 castshadow 那条检查也参与）。
+  const PROBE = "gl.uniform1f(u.lightShadow, layer.lightParams.castshadow ? 1 : 0);";
+  const probeHits = violationsIn(PROBE, "renderer/vendor/we-scene/render/renderer.js").length;
+  if (probeHits < 3)
+    fail(`「只解析不渲染」检测器自检失败：故意注入的违规文本只命中 ${probeHits} 条（应 ≥3：lightParams 读取 + castshadow 越界 + lightShadow 形态）`);
+  // 判据自身的守卫：名单在，说明这一节没被人删空
+  if (!PARSE_ONLY.includes("usecookie") || !PARSE_ONLY.includes("lightsourcesize"))
+    fail("「只解析不渲染」判据的字段名单不完整");
+  let scanned = 0;
+  for (const rel of srcFiles) {
+    const r = relative(ROOT, rel).split(sep).join("/");
+    if (r === SELF_REL) continue; // 本节自己的名单/文案不算消费者
+    if (CONST_JUDGE_SELVES.has(r)) continue; // 本波常量判据脚本按设计要写出这些字段名
+    let txt = "";
+    try { txt = fs.readFileSync(rel, "utf8"); } catch { continue; }
+    scanned++;
+    for (const v of violationsIn(txt, r)) fail(v);
+  }
+  if (!errors.length)
+    ok(`灯光阴影/体积字段只解析不渲染：灯对象 lightParams ${Object.keys(lp || {}).length} 键 + scene.lightconfig 3 键；扫 ${scanned} 个真实源码文件 × ${PARSE_ONLY.length} 个字段名 + castshadow/lightShadow 形态，除 ${PARSE_REL} 外零消费者（检测器正向自检命中 ${probeHits} 条）`);
+}
+
+// ---------- 15. 直射光正例夹具：LIGHTING=1 时直射项**非零**（M1.1，2026-10-12）----------
+//
+// 为什么需要这一节：第 12 节断的是**形状**（着色器文本里有没有那条公式）与**几何**
+// （灯的世界位置、通道、台账），但没有任何一处**求值** —— 「公式写在文本里」与
+// 「这盏灯真的照亮了这个像素」之间还差一次真实求值。本节把
+// `renderer/vendor/we-scene/render/renderer-glsl.js` 里 COPY_LIT_FRAG 的
+// `lightRadiance` / `shadePBRLight` **原文抽出来就地求值**（不写第二份公式：改了
+// 着色器，这一节跟着变），再用**合成**场景/材质对象（不读素材库）判三件事：
+//   ① LIGHTING=1 + 一盏在范围内的灯 ⇒ 直射项 > 0，且与官方公式**逐位**一致；
+//   ② LIGHTING=0 ⇒ 该层根本**不进** lit program（renderer 侧切 copyProg），
+//      直射项恒为 0（恒等，不是「小到看不见」）；
+//   ③ 两代衰减的形状：V1 = 色×saturate(1−d/r)^e（超出半径**恰为 0**）；
+//      老通道 = 色×r²/d²（同一个 d 上远大于 V1 —— 这就是 3737267090 的 20 倍过曝）。
+{
+  const gsrcLit = fs.readFileSync(join(ROOT, "renderer/vendor/we-scene/render/renderer-glsl.js"), "utf8");
+  if (!/COPY_LIT_FRAG/.test(gsrcLit)) fail("renderer-glsl 缺少 COPY_LIT_FRAG（直射光那一半的着色器）");
+  // 从真实着色器文本里抽函数（含 `const float PI = ...` 常量行），把 GLSL 子集
+  // 转成 JS 后求值：只做「去掉类型关键字」这一步（`const float PI` → `const PI`、
+  // 签名里的 `vec3 x` → `x`），**公式本身一个字不改**。
+  const grab = (name) => {
+    const m = gsrcLit.match(new RegExp(`([a-z0-9]+)\\s+${name}\\s*\\([^)]*\\)\\s*\\{[\\s\\S]*?\\n\\}`));
+    return m ? m[0] : null;
+  };
+  const grabLine = (re) => {
+    const m = gsrcLit.match(re);
+    return m ? m[0] : null;
+  };
+  // 每个函数单独转：返回值类型与参数表里的类型关键字统统去掉（只在参数表内，不会碰到
+  // 函数体里的 GLSL 内建调用），公式本身一个字不改。
+  const GLSL_TYPE = new Set(["float", "vec2", "vec3", "vec4", "int", "bool", "mat2", "mat3", "mat4", "void"]);
+  const toJs = (s) => {
+    if (!/\{/.test(s)) return s.replace(/const\s+(float|int)\s+/, "const "); // 常量行
+    const head = s.slice(0, s.indexOf("{"));
+    const name = (head.match(/[A-Za-z_]\w*/g) || []).find((t) => !GLSL_TYPE.has(t));
+    const params = (head.slice(head.indexOf("(") + 1, head.lastIndexOf(")")).match(/[A-Za-z_]\w*/g) || [])
+      .filter((t) => !GLSL_TYPE.has(t)).join(", ");
+    const body = s.slice(s.indexOf("{")).replace(/\b(float|vec3|vec2|int|bool)\s+([A-Za-z_]\w*)\s*=/g, "$2 =");
+    return `function ${name}(${params}) ${body}`;
+  };
+  const parts = [
+    grabLine(/const float PI = [0-9.]+;/),
+    grab("fresnelSchlick"), grab("distributionGGX"), grab("schlickGGX"), grab("geoSmith"),
+    grab("lightRadiance"), grab("shadePBRLight"),
+  ].filter(Boolean);
+  if (parts.length < 7) fail(`未能从 COPY_LIT_FRAG 抽出直射光函数原文（抽到 ${parts.length}/7 段）`);
+  const evalGLSL = new Function(
+    "Math",
+    "clamp", "max", "min", "pow", "saturate", "vec3", "normalize", "length", "dot", "mix", "step",
+    `${parts.map(toJs).join("\n")}
+     return { lightRadiance, shadePBRLight };`,
+  );
+  const clampG = (x, a, b) => Math.min(Math.max(x, a), b);
+  const maxG = (a, b) => Math.max(a, b);
+  const minG = (a, b) => Math.min(a, b);
+  // 逐分量 GLSL 内建（本桶只用到 vec3 + 标量两种情况，与着色器用法一致）
+  const cwise = (f) => (a, b) => (Array.isArray(a) && Array.isArray(b) ? a.map((v, i) => f(v, b[i])) :
+    Array.isArray(a) ? a.map((v) => f(v, b)) : (Array.isArray(b) ? b.map((v) => f(a, v)) : f(a, b)));
+  // GLSL 的 vec3 在 JS 里没有运算符重载（`vec3 * float`、`vec3 + vec3` 会得到 NaN 或字符串
+  // 拼接）。本节按**单轴退化**求值：所有向量取同一条视轴、每个量用它的标量幅度表示，
+  // 于是 `dot(a,b)=a*b`、`length(a)=|a|`、`normalize(a)=sign(a)`、`vec3(x)=x`，而
+  // `a*b` / `a+b` / `a/b` 与逐分量 vec3 运算同值（同轴 ⇒ 三分量相等）。
+  // 收益：函数体一个字符都不用改（公式保持原文）；代价：本节只覆盖同轴构型 ——
+  // 异轴光照的逐分量路径由第 12 节 (e) 的几何断言兜住。
+  const vec3g = (a, b, c) => (b === undefined && c === undefined ? a : [a, b, c]);
+  const dotG = (a, b) => (Array.isArray(a) && Array.isArray(b) ? a.reduce((s, v, i) => s + v * b[i], 0) : a * b);
+  const lenG = (a) => (Array.isArray(a) ? Math.hypot(...a) : Math.abs(a));
+  const normG = (a) => (Array.isArray(a) ? (lenG(a) ? a.map((v) => v / lenG(a)) : a.slice()) : (a > 0 ? 1 : (a < 0 ? -1 : 0)));
+  const mixG = (a, b, t) => cwise((x, y) => x + (y - x) * t)(a, b);
+  const stepG = (edge, x) => cwise((e, v) => (v < e ? 0 : 1))(edge, x);
+  let F = null;
+  try {
+    F = evalGLSL(Math, clampG, cwise(maxG), cwise(minG), Math.pow, (x) => clampG(x, 0, 1), vec3g, normG, lenG, dotG, mixG, stepG);
+  } catch (e) {
+    fail(`直射光函数原文求值失败（着色器文本可能不是合法 GLSL 子集）：${e.message}`);
+  }
+  if (F) {
+    const { lightRadiance, shadePBRLight } = F;
+    // 合成灯与层（进程内构造，不读素材库）：一盏 lpoint 在层正前方 d=50，
+    // 半径 100、指数 2 ⇒ V1 falloff=(1−0.5)^2=0.25；老通道 r²/d²=4
+    // （同一个 d 上差 16 倍 —— 就是 3737267090 老通道过曝 20 倍的成因）。
+    const chan = [1, 0.97647, 0.91765]; // 官方 3737267090 的灯色（见第 12 节 (d2)）
+    const inten = 1.79, radius = 100, exponent = 2, dist = 50;
+    // 官方 V1 分支写的是 `pow(falloff + flt_min, exponent)`（flt_min = 6.103515625e-5，
+    // GLSL 里的 half float 最小正规数）：闭式期望必须带上它，否则会差 1e-4 量级而误判。
+    const FLT_MIN = 6.103515625e-5;
+    const falloff = 1 - dist / radius; // = 0.5（半径 100、灯在 d=50）
+    let v1Peak = 0, oldPeak = 0;
+    for (const cc of chan) {
+      const c = cc * inten; // 官方打包口径：色 × intensity（不预乘 radius²）
+      const gotV1 = lightRadiance(c, radius, exponent, dist, 0);
+      const wantV1 = c * Math.pow(falloff + FLT_MIN, exponent);
+      if (!(gotV1 > 0)) fail(`LIGHTING=1 且灯在范围内时 V1 直射辐照度必须非零，实得 ${gotV1}`);
+      if (Math.abs(gotV1 - wantV1) > 1e-9)
+        fail(`V1 辐照度应 = 色×intensity×pow(saturate(1−d/r)+flt_min, e) = ${wantV1}，实得 ${gotV1}`);
+      const gotOld = lightRadiance(c, radius, exponent, dist, 1);
+      const wantOld = (c * radius * radius) / (dist * dist);
+      if (!(gotOld > 0)) fail(`老通道直射辐照度必须非零，实得 ${gotOld}`);
+      if (Math.abs(gotOld - wantOld) > 1e-9)
+        fail(`老通道辐照度应 = 色×intensity×r²/d² = ${wantOld}，实得 ${gotOld}`);
+      // V1 的 step 门：超出半径 ⇒ **恰为 0**（不是渐近小）
+      const out = lightRadiance(c, radius, exponent, radius + 1, 0);
+      if (out !== 0) fail(`V1 超出半径应恰为 0（官方 step 门），实得 ${out}`);
+      v1Peak = Math.max(v1Peak, gotV1);
+      oldPeak = Math.max(oldPeak, gotOld);
+    }
+    if (!(oldPeak / v1Peak > 10))
+      fail(`两代公式在同一盏灯上应差一个量级（20 倍过曝的成因），实得 ${(oldPeak / v1Peak).toFixed(1)}×`);
+    // 正例夹具：一盏在范围内的灯照在 LIGHTING=1 的层上 ⇒ 直射项 > 0
+    const albedo = 0.5, N = 1, V = 1, f0 = 0.04, roughness = 0.5, metallic = 0;
+    const rad = lightRadiance(chan[0] * inten, radius, exponent, dist, 0);
+    const shaded = shadePBRLight(N, dist, V, albedo, rad, f0, roughness, metallic);
+    if (!(shaded > 0))
+      fail(`直射项正例夹具：一盏灯照亮一个 LIGHTING 层时合计必须 > 0，实得 ${shaded}`);
+    if (!Number.isFinite(shaded) || shaded < 0)
+      fail(`直射项必须是有限非负值，实得 ${shaded}`);
+    // 反例（数值）：辐照度为 0（= 0 盏灯，或 LIGHTING=0 的层根本不进这个 program）
+    const shaded0 = shadePBRLight(N, dist, V, albedo, 0, f0, roughness, metallic);
+    if (shaded0 !== 0)
+      fail(`辐照度为 0 时直射项必须恰为 0，实得 ${shaded0}`);
+    // 反例（结构）：LIGHTING=0 的层在 renderer 里根本不进 lit program
+    const rsrcL = fs.readFileSync(join(ROOT, "renderer/vendor/we-scene/render/renderer.js"), "utf8");
+    if (!/layer\.lightingEnabled \? copyLitProg : copyProg/.test(rsrcL))
+      fail("renderer 未按 lightingEnabled 在 copyLitProg / copyProg 之间切（LIGHTING=0 必须不进直射光 program）");
+    if (!/const baseProg = layer\.lightingEnabled \? copyLitProg : copyProg/.test(rsrcL))
+      fail("效果链底图那一趟未按 lightingEnabled 切着色器（LIGHTING=0 的层不得吃直射光）");
+    // 灯为 0 盏（LIGHTING=1 但场景无灯）⇒ u_LightCount=0 ⇒ 循环不执行 ⇒ 直射项恒 0
+    if (!/for \(int i = 0; i < 4; i\+\+\) \{\s*if \(i >= u_LightCount\) break;/.test(gsrcLit))
+      fail("COPY_LIT_FRAG 的灯循环未按 u_LightCount 门控（0 盏灯时直射项必须恒 0）");
+    if (!errors.length)
+      ok(`直射光正例：LIGHTING=1 且灯在范围内 ⇒ V1 辐照度 ${v1Peak.toFixed(3)}、老通道 ${oldPeak.toFixed(1)}（差 ${(oldPeak / v1Peak).toFixed(1)}×），shadePBRLight 合计 ${shaded.toFixed(4)} > 0；LIGHTING=0 / 0 盏灯不进该 program`);
+  }
 }
 
 function msrc2() {

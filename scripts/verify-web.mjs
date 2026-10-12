@@ -4,6 +4,9 @@
  *
  * 覆盖：
  *   1. rewriteHtml：shim 在作者 script 之前；补 <base>；幂等；残缺 HTML；seedScript
+ *   1b. host/we-web-html.mjs（/web/ 响应注入）必须与 rewriteHtml **逐字节同构**：
+ *       正常/无 head/残缺 HTML 等价、幂等、宿主 data-we-shim="host" 互操作、
+ *       伪造样本（注释 / <meta content> / 脚本正文）必须仍注入、脚本在 head 之前时 shim-first
  *   2. hasBlockingCsp / entryDirUrl
  *   3. shim：PropertyListener setter 立即 flush；音频 128；暂停后不再推；__weThrottled；
  *      Media*Listener / MediaIntegration / RequestRandomFile / 目录文件 / Plugin stub
@@ -2125,6 +2128,118 @@ function runShim(extras, opts) {
   check(
     /injectWebShim/.test(hostTs) && /isHtmlPath/.test(hostTs),
     "wallpaper-host 必须对 /web/ HTML 响应注入 WE shim",
+  );
+
+  // host 侧（/web/ 响应）注入必须与 renderer 侧 rewriteHtml **逐字节同构**。两条路径服务同一个
+  // 素材：同源入口走 host 的 `/web/` 原始 URL，跨源入口走 web.ts 的 blob 挂载 —— 判重与插入点
+  // 一旦不同，同一份壁纸在两种挂载下行为就不一样。host/we-web-html.mjs 的注释曾自称同构，实现
+  // 却是旧的 `includes("data-we-shim")` 存在性判据 + 只认字面 <head>：三类伪造样本被静默短路
+  // （shim 是 rAF 节流/指针桥/音频泵的载体，少了它宿主侧没有任何报错），作者在 <head> 之前放
+  // 脚本时我们的 shim 反而排在它后面（作者先跑并置上 __weShimInstalled ⇒ shim 整体 return）。
+  //
+  // 判据取「两条实现同参数逐字节相等」而不是各自复算期望串：复算副本会在实现改坏时照绿
+  // （importIsolatedFn 的注释里踩过同一个坑）。host/ 不得 import renderer/src（verify-arch:64-68），
+  // 所以这里只共享**输入**，不共享模块。
+  const hostWebHtml = await import(
+    pathToFileURL(path.join(ROOT, "host/we-web-html.mjs")).href
+  );
+  const HOST_SHIM = "window.__HOST_SHIM=1;";
+  const hostSamples = {
+    normal:
+      `<!DOCTYPE html><html><head><title>t</title>\n` +
+      `<script>window.wallpaperRegisterAudioListener(function(){})</script>\n</head><body>hi</body></html>`,
+    scriptBeforeHead: `<!doctype html><script>window.__weShimInstalled=1</script><html><head><title>t</title></head><body>x</body></html>`,
+    bare: `<script>author()</script>`,
+    htmlNoHead: `<html><body><script>a()</script></body></html>`,
+    alreadyHost: `<!doctype html><html><head><script data-we-shim="host">/*host shim*/</script></head><body>x</body></html>`,
+    alreadySrc: `<!doctype html><html><head><script data-we-shim-src="1">/*shim*/</script></head><body>x</body></html>`,
+    forgedComment: `<!-- data-we-shim --><html><head><script>a()</script></head></html>`,
+    forgedMeta: `<html><head><meta content="data-we-shim-src=1"><script>a()</script></head></html>`,
+    forgedBody: `<html><head><script>document.querySelector("[data-we-shim]")</script></head></html>`,
+    // 注释形态（task-16）：注释里包着**完整 shim 元素**。注释内容不解析、不执行，作者把标记写进
+    // 注释就能让注入静默消失 —— 比「出现过属性名」更隐蔽，旧行为两侧都会误判「已注入」。
+    commentedShim: `<!-- <script data-we-shim-src="1"></script> --><html><head><script>a()</script></head></html>`,
+    commentedShimHost: `<!-- <script data-we-shim="host">/*h*/</script> --><html><head><script>a()</script></head></html>`,
+    commentedHead: `<!-- <head> --><html><body><script>a()</script></body></html>`,
+    unclosedComment: `<!-- <script data-we-shim-src="1"></script><html><head><script>a()</script></head></html>`,
+    conditionalComment: `<!--[if IE]><script data-we-shim-src="1"></script><![endif]--><html><head><script>a()</script></head></html>`,
+    realPlusCommentedFake: `<!-- <script data-we-shim-src="1"></script> --><html><head><script data-we-shim="host">/*h*/</script></head></html>`,
+    empty: ``,
+  };
+  for (const [name, sample] of Object.entries(hostSamples)) {
+    const hostOut = hostWebHtml.injectWebShim(sample, { shimSource: HOST_SHIM });
+    const rwOut = rw.rewriteHtml(sample, HOST_SHIM, {});
+    check(
+      hostOut === rwOut,
+      `host 侧注入必须与 rewriteHtml 逐字节同构（样本 ${name}）`,
+    );
+    check(
+      hostWebHtml.injectWebShim(hostOut, { shimSource: HOST_SHIM }) === hostOut,
+      `host 侧注入必须幂等（样本 ${name}）`,
+    );
+  }
+  // 正常样本 golden：紧跟 <head> 开标签，且排在作者脚本之前（顺序断言，不是「出现过」）。
+  const hostGolden = hostWebHtml.injectWebShim(hostSamples.normal, { shimSource: HOST_SHIM });
+  check(
+    /<head><script data-we-shim-src="1">/.test(hostGolden) &&
+      hostGolden.indexOf("__HOST_SHIM") < hostGolden.indexOf("wallpaperRegisterAudioListener"),
+    "host 侧 shim 应紧跟 <head> 且排在作者脚本之前（golden 位置）",
+  );
+  // 伪造样本必须仍注入：属性名是素材可控字符串，命中即不注入是**静默**失败。
+  for (const name of ["forgedComment", "forgedMeta", "forgedBody"]) {
+    const out = hostWebHtml.injectWebShim(hostSamples[name], { shimSource: HOST_SHIM });
+    check(out.indexOf("__HOST_SHIM") > 0, `host 侧伪造样本必须仍注入（${name}）`);
+  }
+  // 宿主 data-we-shim="host" 互操作：认得出、不装第二套（双 shim → 两道 rAF 节流叠加，
+  // 实测 15fps 上限被限两次 → 7.5fps）。旧实现写死 `data-we-shim="1"`，认不出这个值。
+  check(
+    hostWebHtml.injectWebShim(hostSamples.alreadyHost, { shimSource: HOST_SHIM }) ===
+      hostSamples.alreadyHost,
+    `host 侧必须认得宿主 data-we-shim="host"（不得装第二套 shim）`,
+  );
+  // 脚本在 <head> 之前：shim 必须排到它前面，否则作者脚本先执行、把 __weShimInstalled 置上。
+  const hostOrder = hostWebHtml.injectWebShim(hostSamples.scriptBeforeHead, {
+    shimSource: HOST_SHIM,
+  });
+  check(
+    hostOrder.indexOf("__HOST_SHIM") < hostOrder.indexOf("__weShimInstalled"),
+    "host 侧：<head> 之前的作者脚本也必须排在我们之后",
+  );
+  // 注释形态（task-16）：注释里包着的完整 shim 元素**不算在场** —— 注释内容浏览器不解析、不执行，
+  // 旧行为（两侧同构地）误判「已注入」⇒ 不注入 ⇒ rAF 节流/指针桥/音频泵全丢，且 /web/ 侧无诊断。
+  for (const name of [
+    "commentedShim",
+    "commentedShimHost",
+    "unclosedComment",
+    "conditionalComment",
+  ]) {
+    const out = hostWebHtml.injectWebShim(hostSamples[name], { shimSource: HOST_SHIM });
+    check(out.indexOf("__HOST_SHIM") > 0, `host 侧注释形态样本必须仍注入（${name}）`);
+  }
+  // 注释形态样本去掉注释后，必须与「无注释的同内容样本」逐字节相同 ⇒ 插入点不受注释里的
+  // 假 <script> 影响（否则 shim 会被提到 `<!doctype>` 之前，浏览器进怪异模式）。
+  check(
+    hostWebHtml
+      .injectWebShim(hostSamples.commentedShim, { shimSource: HOST_SHIM })
+      .replace(`<!-- <script data-we-shim-src="1"></script> -->`, "") ===
+      hostWebHtml.injectWebShim(`<html><head><script>a()</script></head></html>`, {
+        shimSource: HOST_SHIM,
+      }),
+    "host 侧：注释形态样本去掉注释后必须与无注释同内容样本逐字节相同",
+  );
+  // 注释里的 <head> 不是插入锚点（注进注释区间会被浏览器一起吞掉 ⇒ 等于没注入，更隐蔽）
+  const hostCommentedHead = hostWebHtml.injectWebShim(hostSamples.commentedHead, {
+    shimSource: HOST_SHIM,
+  });
+  check(
+    hostCommentedHead.indexOf("__HOST_SHIM") > hostCommentedHead.indexOf("-->"),
+    "host 侧：注释里的 <head> 不是插入锚点（shim 不得落在注释区间内）",
+  );
+  // 反面：注释里的假 shim + 真实宿主 shim 同时在场 ⇒ 仍须只认真 shim（不得因剥注释多注一套）
+  check(
+    hostWebHtml.injectWebShim(hostSamples.realPlusCommentedFake, { shimSource: HOST_SHIM }) ===
+      hostSamples.realPlusCommentedFake,
+    "host 侧：注释里的假 shim + 真实宿主 shim ⇒ 只认真 shim（不重复注入）",
   );
   // 官方 CEF 的属性表按字母序下发（C++ 有序容器遍历），不是 project.json 声明序。
   // corsair_collection（官方内置）：activateWallpaper 处理 "scene" 时直接

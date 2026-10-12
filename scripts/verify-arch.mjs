@@ -61,8 +61,8 @@ for (const f of jsFiles) {
   }
 }
 
-// host/ 不得 import 引擎与 renderer/src（bench 允许：测试台是引擎的只读消费方）
-for (const f of listFiles(path.join(ROOT, "host"), ".ts")) {
+// host/ 不得 import 引擎与 renderer/src（bench 允许：测试台是引擎的只读消费方）—— .ts 与 .mjs 同查
+for (const f of listFiles(path.join(ROOT, "host"), ".ts").concat(listFiles(path.join(ROOT, "host"), ".mjs"))) {
   const src = fs.readFileSync(f, "utf8");
   const bad = /from\s+['"][^'"]*renderer\/(vendor|src)/.exec(src);
   check(!bad, `host/${path.basename(f)}：宿主模拟不得 import 引擎或渲染器源码`);
@@ -155,9 +155,145 @@ if (fs.existsSync(entryHtml)) {
   check(html.includes("/renderer/src/main.ts"), "契约面：renderer/index.html 必须引用 /renderer/src/main.ts");
 }
 
+// `window.__wp = { … }` 的**直接成员**扫描器（契约面用）。
+// 按花括号深度取键（只有深度 1 的键才是 __wp 的方法），扫描时跳过字符串 / 模板串 / 注释，
+// 因此既不受缩进影响，也不会把方法体或实参里的名字当成成员。
+// 为什么不用 `^  (\w+)\s*\(` 这类缩进正则：它只覆盖方法简写，`sneakyProp: () => 1,`
+// 这种属性语法会被**静默漏分档**（task-14 验收 §3① 实测：漏掉后没有任何断言会红）。
+// 返回 { name, kind, line }[]，kind ∈ shorthand（方法简写）/ fnprop（属性持函数）/
+// valueprop（属性持非函数）/ bare（简写属性）/ spread（展开）/ quoted（字符串键）/
+// computed（计算键）/ generator（生成器方法）/ syntax（其它形态）。
+function scanWpMembers(block, lineBase) {
+  const out = [];
+  const len = block.length;
+  const isWs = (c) => c === " " || c === "\t" || c === "\n" || c === "\r";
+  // 跳过空白与注释：成员起始处可能先遇到注释行（`},` → `// 注释` → `release() {`）
+  const skipTrivia = (i) => {
+    for (;;) {
+      while (i < len && isWs(block[i])) i++;
+      if (block[i] === "/" && block[i + 1] === "/") {
+        const nl = block.indexOf("\n", i);
+        i = nl < 0 ? len : nl + 1;
+        continue;
+      }
+      if (block[i] === "/" && block[i + 1] === "*") {
+        const close = block.indexOf("*/", i + 2);
+        i = close < 0 ? len : close + 2;
+        continue;
+      }
+      return i;
+    }
+  };
+  const lineOf = (idx) => lineBase + block.slice(0, idx).split("\n").length - 1;
+  let i = block.indexOf("{"); // 字面量自身的 `{`
+  let depth = 0;
+  let paren = 0;
+  let bracket = 0;
+  let expectKey = false;
+  while (i < len) {
+    // 成员起始优先于通用字符扫描：expectKey 只在 depth 1 的 `,` 或字面量 `{` 之后为真，
+    // 此时下一个 token 一定是键（键前可能还隔着换行与注释），必须先解析键。
+    if (expectKey) {
+      let j = skipTrivia(i);
+      const mem = { name: null, kind: "syntax(?)", line: lineOf(j) };
+      if (block.startsWith("...", j)) {
+        mem.kind = "spread";
+        out.push(mem);
+        expectKey = false;
+        i = Math.max(j + 3, i + 1);
+        continue;
+      }
+      let generator = false;
+      if (block[j] === "*") { generator = true; j = skipTrivia(j + 1); }
+      if (block[j] === '"' || block[j] === "'") {
+        const q = block[j];
+        const s = j + 1;
+        j = s;
+        while (j < len && block[j] !== q) j++;
+        mem.name = block.slice(s, j);
+        mem.kind = "quoted";
+        j++;
+      } else if (block[j] === "[") {
+        const s = j;
+        let d = 0;
+        while (j < len) {
+          if (block[j] === "[") d++;
+          else if (block[j] === "]") { d--; if (d === 0) { j++; break; } }
+          j++;
+        }
+        mem.name = block.slice(s, j);
+        mem.kind = "computed";
+      } else {
+        const km = /^[A-Za-z_$][\w$]*/.exec(block.slice(j, len));
+        if (!km) { expectKey = false; i = Math.max(j + 1, i + 1); continue; }
+        mem.name = km[0];
+        j += mem.name.length;
+        if (mem.name === "async") {
+          const km2 = /^\s*([A-Za-z_$][\w$]*)/.exec(block.slice(j, len));
+          if (km2) { mem.name = km2[1]; j += km2[0].length; }
+        }
+        if (generator) mem.kind = "generator";
+      }
+      const k = skipTrivia(j);
+      if (mem.kind === "syntax(?)") {
+        if (block[k] === "(") mem.kind = "shorthand";
+        else if (block[k] === ":") {
+          const v = skipTrivia(k + 1);
+          mem.kind = /^(?:async\s+)?(?:function\b|\()/.test(block.slice(v, v + 16)) ? "fnprop" : "valueprop";
+        } else if (block[k] === "," || block[k] === "}") mem.kind = "bare";
+        else mem.kind = "syntax(" + String(block[k]) + ")";
+      }
+      out.push(mem);
+      expectKey = false;
+      i = Math.max(j, k, i + 1);
+      continue;
+    }
+
+    const ch = block[i];
+    if (ch === "/" && block[i + 1] === "/") {
+      const nl = block.indexOf("\n", i);
+      i = nl < 0 ? len : nl + 1;
+      continue;
+    }
+    if (ch === "/" && block[i + 1] === "*") {
+      const close = block.indexOf("*/", i + 2);
+      i = close < 0 ? len : close + 2;
+      continue;
+    }
+    if (ch === '"' || ch === "'" || ch === "`") {
+      const q = ch;
+      i++;
+      while (i < len) {
+        if (block[i] === "\\") { i += 2; continue; }
+        if (block[i] === q) { i++; break; }
+        i++;
+      }
+      continue;
+    }
+    if (ch === "{") { depth++; i++; expectKey = depth === 1; continue; }
+    if (ch === "}") {
+      depth--;
+      i++;
+      // 成员体结束：括号/方括号计数归零。正则字面量或畸形文本里的 `(` / `[` 可能让计数
+      // 一直偏高，若不带自愈，后续成员分隔逗号会被全部跳过（静默漏成员）。
+      if (depth === 1) { paren = 0; bracket = 0; }
+      expectKey = false;
+      continue;
+    }
+    if (ch === "(") { paren++; i++; continue; }
+    if (ch === ")") { if (paren > 0) paren--; i++; continue; }
+    if (ch === "[") { bracket++; i++; continue; }
+    if (ch === "]") { if (bracket > 0) bracket--; i++; continue; }
+    // 成员分隔逗号：必须同时不在圆括号/方括号里（`foo: (a, b),` 的逗号不是成员分隔）
+    if (ch === "," && depth === 1 && paren === 0 && bracket === 0) { i++; expectKey = true; continue; }
+    i++;
+  }
+  return out;
+}
+
 const mainTs = fs.readFileSync(path.join(ROOT, "renderer/src/main.ts"), "utf8");
-// window.__wp = { setWallpaper(cfg) {...}, ... } —— 对象字面量方法简写，
-// 取赋值开始到配对右花括号之间的块，收集 2 层缩进的方法名。
+// window.__wp = { setWallpaper(cfg) {...}, ... } —— 取赋值开始到配对右花括号之间的块，
+// 用 scanWpMembers 按花括号深度收集**直接成员**（缩进无关；方法简写与属性语法都算成员）。
 const wpStart = mainTs.indexOf("window.__wp = {");
 check(wpStart >= 0, "契约面：main.ts 缺少 window.__wp 赋值");
 const defined = new Set();
@@ -177,39 +313,67 @@ if (wpStart >= 0) {
   check(end > 0, "契约面：window.__wp 赋值块无法解析（括号配对失败）");
   if (end > 0) {
     const block = mainTs.slice(wpStart, end);
-    const mRe = /^  (\w+)\s*\(/gm;
-    let m;
-    while ((m = mRe.exec(block))) defined.add(m[1]);
+    const lineBase = mainTs.slice(0, wpStart).split("\n").length;
+    const wpMembers = scanWpMembers(block, lineBase);
+    for (const mem of wpMembers) if (mem.name) defined.add(mem.name);
+    // 形态断言：__wp 的成员必须是「标识符键 + 方法简写 / 函数属性」。字符串键、计算键、
+    // 展开、生成器、非函数值都会让分档比对失去意义或悄悄多挂一个入口（宿主按名调用）。
+    const wpBadShape = wpMembers.filter((mem) => mem.kind !== "shorthand" && mem.kind !== "fnprop");
+    check(
+      wpBadShape.length === 0,
+      `契约面：window.__wp 成员必须是方法简写或函数属性 —— 违规 ${wpBadShape
+        .map((mem) => `${mem.name ?? "…"}@L${mem.line}(${mem.kind})`)
+        .join(" / ")}`,
+    );
   }
 }
-const REQUIRED_WP = [
-  "setWallpaper",
-  "pause",
-  "resume",
-  "setFit",
-  "setVolume",
-  "release",
-  "restore",
-  "setRenderDpr",
-  "setSceneFps",
-  "updateWebProps",
-  // 外部指针注入（桌面 underlay 层收不到鼠标事件，宿主轮询系统鼠标后推入）。
-  // 下游 WallpaperEM 按 docs/INTEGRATION.md 对接；改名或删除会静默断掉桌面交互，
-  // 且没有任何报错 —— 壁纸只是永远不响应鼠标，所以纳入契约面守卫。
-  "pushPointer",
-  "pointerLeave",
-  // 滚轮注入（含 macOS 触摸板双指滚动与捏合）。同样是静默失效类契约：
-  // 宿主推了没人接，网页壁纸只是不响应滚轮。
-  "pushWheel",
-  // 媒体集成两条：显示数据（`setMedia`）与控制面（`setMediaControl`）。iframe 宿主
-  // （dsh-wallpaper-engine）按名调用，缺失时静默 no-op —— 壁纸只是永远显示模拟曲目、
-  // 播放按钮点了没反应，没有任何报错。控制面是控制反转（壁纸按钮 → 真实播放器）的注入点。
-  "setMedia",
-  "setMediaControl",
-];
-for (const name of REQUIRED_WP) {
+// __wp 表面的分档表（main.ts 导出，见 main.ts 表注释与 docs/COMPLIANCE.md §四）：
+//   RENDER_PAGE_WP  渲染页档（壁纸窗口 / 测试台 / 编辑器预览都要的完整控制面）
+//   HOST_ONLY_WP    宿主能力档（setWallpaper / capture / setAudioBridge，显式 strict 嵌入形态下摘掉）
+// 两表必须**恰好覆盖** `window.__wp` 的全部方法：新加一个方法忘了分档就红。
+// 下面这些名字是「静默失效类契约」——宿主按名调用，缺失只表现为壁纸不响应、没有任何报错，
+// 所以必须机器守卫（pushPointer / pointerLeave / pushWheel / setMedia / setMediaControl 等，
+// 逐条理由见 docs/INTEGRATION.md 与 main.ts 里 RENDER_PAGE_WP 的分组注释）。
+const readWpTable = (name) => {
+  const m = new RegExp(`export const ${name} = \\[([\\s\\S]*?)\\] as const`).exec(mainTs);
+  check(Boolean(m), `契约面：main.ts 缺少 ${name} 表（__wp 分档依据，见 docs/COMPLIANCE.md §四）`);
+  if (!m) return [];
+  const names = [];
+  const re = /"(\w+)"/g;
+  let mm;
+  while ((mm = re.exec(m[1]))) names.push(mm[1]);
+  return names;
+};
+const RENDER_PAGE_WP = readWpTable("RENDER_PAGE_WP");
+const HOST_ONLY_WP = readWpTable("HOST_ONLY_WP");
+check(RENDER_PAGE_WP.length > 0 && HOST_ONLY_WP.length > 0, "契约面：__wp 分档表不得为空");
+for (const name of RENDER_PAGE_WP) {
   check(defined.has(name), `契约面：window.__wp.${name} 在 main.ts 里缺失（见 docs/INTEGRATION.md）`);
 }
+for (const name of ["setWallpaper", "capture", "setAudioBridge"]) {
+  check(HOST_ONLY_WP.includes(name), `契约面：HOST_ONLY_WP 必须包含 ${name}（宿主能力档）`);
+}
+const wpUntiered = [...defined].filter((n) => !RENDER_PAGE_WP.includes(n) && !HOST_ONLY_WP.includes(n));
+const wpStale = [...RENDER_PAGE_WP, ...HOST_ONLY_WP].filter((n) => !defined.has(n));
+check(
+  wpUntiered.length === 0,
+  `契约面：__wp.${wpUntiered.join(" / ")} 未分档（RENDER_PAGE_WP ∪ HOST_ONLY_WP 必须覆盖全部方法）`,
+);
+check(
+  wpStale.length === 0,
+  `契约面：分档表里的 ${wpStale.join(" / ")} 在 __wp 字面量里不存在（改名/删除后忘了同步表）`,
+);
+// 最小权限的落点：strict 形态必须真的摘掉宿主档。文本判据 —— 只证摘除点在源码里存在，
+// 不证运行时行为（运行时由 main.ts 的 if + delete 决定，不在这里模拟 DOM）。
+check(
+  /if \(initialCfg\.webSandbox === "strict" && window\.__wp\)[\s\S]{0,200}for \(const k of HOST_ONLY_WP\) delete/.test(mainTs),
+  "契约面：strict 形态下 HOST_ONLY_WP 必须被摘除（最小权限 / 方案 B）",
+);
+// 三态档位：缺省 undefined（= 收紧档）/ 显式 strict / 显式 legacy 逃生门。
+check(
+  /webSandbox: \(\(\) => \{[\s\S]{0,200}"legacy"[\s\S]{0,200}\}\)\(\)/.test(mainTs),
+  '契约面：main.ts 的 webSandbox 必须三态解析（缺省 = 收紧档；显式 "legacy" 是嵌入方逃生门）',
+);
 
 // 发布类型的契约面：api/index.ts 是运行时导出清单，api/entry.d.ts 是手写的
 // 类型声明（build:lib 原样拷成 dist/lib/webwallgl.d.ts）。两边必须一一对应 ——
@@ -721,6 +885,47 @@ for (const name of REQUIRED_WP) {
     for (const n of ["CameraQueueMode", "CameraPathKind", "CameraPathClipInfo", "CameraPathReport", "CameraPathPose", "CameraFovZoom"]) {
       check(editorApi.includes(n), `M12/B7 新类型 ${n} 必须从 renderer/src/api/editor.ts 出口导出（页面不许 import 深层实现）`);
     }
+  }
+}
+
+// ---------- 门禁 20：GLSL 独立成 .glsl 文件（issue #14） ----------
+{
+  // JS/TS 里不再内联 GLSL 模板串：着色器统一走 editor/shaders/ 与 renderer/src/editor/shaders/ 的 .glsl；
+  // 打包时由 scripts/lib/glsl-plugin.mjs 剥掉 GLSL 注释/空行（WE 契约注释 `// {"material":…}` 除外）。
+  const glslRoots = ["editor", "renderer/src", "host", "shared"];
+  const badInline = [];
+  const scanGlsl = (dir) => {
+    for (const e of fs.readdirSync(dir, { withFileTypes: true })) {
+      const p = path.join(dir, e.name);
+      if (e.isDirectory()) scanGlsl(p);
+      else if (e.name.endsWith(".ts") && !e.name.endsWith(".d.ts")) {
+        const s = fs.readFileSync(p, "utf8");
+        // 内联 GLSL 判据：模板串里同时有 uniform 声明与 GLSL 主输出/引擎内建
+        for (const m of s.matchAll(/`([^`]*\buniform\s+\w+\s+\w+[^`]*)`/g)) {
+          if (/gl_FragColor|gl_Position|texSample2D|texture2D|g_ModelViewProjectionMatrix|g_Texture0\b/.test(m[1])) {
+            badInline.push(`${p} : ${m[1].slice(0, 60).replace(/\s+/g, " ")}…`);
+            break;
+          }
+        }
+      }
+    }
+  };
+  for (const root of glslRoots) if (fs.existsSync(root)) scanGlsl(root);
+  check(
+    badInline.length === 0,
+    "GLSL 全部独立成 .glsl 文件（issue #14）：JS/TS 里不再内联着色器模板串",
+    badInline.length ? `违规 ${badInline.length} 处：${badInline.slice(0, 3).join(" ; ")}` : "",
+  );
+
+  // 门禁 20.1：构建产物剥掉 GLSL 注释/空行（契约注释保留，署名注释随工程自包含）
+  if (fs.existsSync("dist/lib")) {
+    const distHits = [];
+    for (const f of fs.readdirSync("dist/lib")) {
+      if (!/\.(?:mjs|js)$/.test(f)) continue;
+      const txt = fs.readFileSync(path.join("dist/lib", f), "utf8");
+      if (/\/\/[ \t]*原作作者|\/\/[ \t]*版权与出处/.test(txt)) distHits.push(f + "（署名注释残留）");
+    }
+    check(distHits.length === 0, "构建产物剥掉 GLSL 注释/空行（契约注释保留）", distHits.join(","));
   }
 }
 

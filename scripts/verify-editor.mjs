@@ -48,6 +48,7 @@ import zlib from "node:zlib";
 import { spawnSync } from "node:child_process";
 import { pathToFileURL } from "node:url";
 import { ROOT, LIB, imp } from "./lib/verify-kit.mjs";
+import { glslModule, minifyGlsl, normalizeTail, isPrefixBlock, withHeaderComments } from "./lib/glsl-plugin.mjs";
 
 let failed = 0;
 let passed = 0;
@@ -98,19 +99,42 @@ const sourceAlias = {
   },
 };
 
+/** .glsl 模块装载：与 scripts/lib/glsl-plugin.mjs 的 build 口径一致（剥注释/空行，契约注释保留） */
+const glslLoader = {
+  name: "glsl-text",
+  setup(b) {
+    b.onLoad({ filter: /\.glsl$/ }, (a) => ({
+      contents: (() => {
+        const raw = fs.readFileSync(a.path, "utf8");
+        let code = minifyGlsl(raw);
+        if (isPrefixBlock(a.path) && a.path.endsWith(".head.glsl")) code = withHeaderComments(code, raw);
+        return glslModule(normalizeTail(code, isPrefixBlock(a.path)));
+      })(),
+      loader: "js",
+    }));
+  },
+};
+
 /** 把 editor/<name>.ts 打成可导入模块；overrides = { 绝对路径: 改过的源码 }（变异红测用） */
 async function loadEditorModule(name, overrides = {}) {
-  const plugins = [sourceAlias];
+  // mutate 插件必须在 glslLoader 之前注册：esbuild 同 filter 的后注册 onLoad 覆盖前注册
+  const plugins = [];
   if (Object.keys(overrides).length) {
     plugins.push({
       name: "mutate",
       setup(b) {
+        // .ts 走 ts loader；.glsl 走 js loader（glslLoader 已把文本包成模块，变异直接换模块文本）
         b.onLoad({ filter: /\.ts$/ }, (args) =>
           overrides[args.path] !== undefined ? { contents: overrides[args.path], loader: "ts" } : undefined,
+        );
+        b.onLoad({ filter: /\.glsl$/ }, (args) =>
+          // 变异表优先于 glslLoader（esbuild 同 filter 的后注册 onLoad 覆盖前注册）
+          overrides[args.path] !== undefined ? { contents: glslModule(overrides[args.path]), loader: "js" } : undefined,
         );
       },
     });
   }
+  plugins.push(glslLoader, sourceAlias);
   const out = await build({
     entryPoints: [path.join(ROOT, "editor", `${name}.ts`)],
     bundle: true,
@@ -141,6 +165,7 @@ async function loadHostModule(srcText) {
     packages: "external",
     logLevel: "silent",
     plugins: [
+      glslLoader,
       {
         name: "host-stubs",
         setup(b) {
@@ -2254,9 +2279,11 @@ section("AA3. 编辑器音频源 editor/audio-live.ts（系统音频 / 试听 �
     "只在真开着音频源时才带 audio 键（键存在 = 接管整条音频模拟），换源走 setAudio 热更",
   );
   const fxSrc = fs.readFileSync(path.join(ROOT, "editor/effects.ts"), "utf8");
+  // GLSL 已抽到独立 .glsl（issue #14）：声明在 audiobars.decl.glsl，装配在 effects.ts
+  const abDecl = fs.readFileSync(path.join(ROOT, "editor/shaders/effects/audiobars.decl.glsl"), "utf8");
   check(
-    /id: "audiobars"|def\("audiobars"/.test(fxSrc) && /g_AudioSpectrum32Left\[32\]/.test(fxSrc) && /g_AudioSpectrum32Right\[32\]/.test(fxSrc),
-    "内置效果 audiobars（音频频谱条）：声明 WE 的 g_AudioSpectrum32* 直接吃引擎频谱",
+    /id: "audiobars"|def\("audiobars"/.test(fxSrc) && /AUDIOBARS_DECL/.test(fxSrc) && /g_AudioSpectrum32Left\[32\]/.test(abDecl) && /g_AudioSpectrum32Right\[32\]/.test(abDecl),
+    "内置效果 audiobars（音频频谱条）：声明 WE 的 g_AudioSpectrum32* 直接吃引擎频谱（声明在 audiobars.decl.glsl）",
   );
 }
 
@@ -3331,8 +3358,8 @@ async function loadRendererTs(rel, overrides = {}) {
     target: "es2022",
     logLevel: "silent",
     plugins: Object.keys(overrides).length
-      ? [{ name: "mutate", setup: (b) => b.onLoad({ filter: /\.ts$/ }, (a) => (overrides[a.path] !== undefined ? { contents: overrides[a.path], loader: "ts" } : undefined)) }]
-      : [],
+      ? [glslLoader, { name: "mutate", setup: (b) => b.onLoad({ filter: /\.ts$/ }, (a) => (overrides[a.path] !== undefined ? { contents: overrides[a.path], loader: "ts" } : undefined)) }]
+      : [glslLoader],
   });
   const tmp = path.join(tmpRoot, `r-${Math.random().toString(36).slice(2)}.mjs`);
   fs.writeFileSync(tmp, out.outputFiles[0].text);
@@ -4983,11 +5010,15 @@ section("J. 变异红测");
     check(json(mr.copyKeysAt(relM, 0)) !== json({ origin: [100, 50, 0] }), "copyKeysAt 不加回基准时 relative 判据变红");
   }
   {
-    const fxPath = path.join(ROOT, "editor/effects.ts");
-    const fxSrc = fs.readFileSync(fxPath, "utf8");
-    const mutFx = fxSrc.replace("g_FxStart <= g_FxEnd ? m : 1.0 - m", "m").replace("(floor(v_TexCoord / cell) + vec2(0.5, 0.5)) * cell", "floor(v_TexCoord / cell) * cell");
-    check(mutFx !== fxSrc && (mutFx.match(/g_FxStart <= g_FxEnd/g) ?? []).length === 0, "注入点存在（渐隐方向 / 像素化格心）");
-    const mf = await loadEditorModule("effects", { [fxPath]: mutFx });
+    // GLSL 逻辑抽到 .glsl（issue #14）：变异红测改打 .glsl 文件本身（fade / pixelate 的 body）
+    const fadePath = path.join(ROOT, "editor/shaders/effects/fade.body.glsl");
+    const pixPath = path.join(ROOT, "editor/shaders/effects/pixelate.body.glsl");
+    const fadeSrc = fs.readFileSync(fadePath, "utf8");
+    const pixSrc = fs.readFileSync(pixPath, "utf8");
+    const mutFade = fadeSrc.replace("g_FxStart <= g_FxEnd ? m : 1.0 - m", "m");
+    const mutPix = pixSrc.replace("(floor(v_TexCoord / cell) + vec2(0.5, 0.5)) * cell", "floor(v_TexCoord / cell) * cell");
+    check(mutFade !== fadeSrc && mutPix !== pixSrc && (mutFade.match(/g_FxStart <= g_FxEnd/g) ?? []).length === 0, "注入点存在（渐隐方向 / 像素化格心）");
+    const mf = await loadEditorModule("effects", { [fadePath]: mutFade, [pixPath]: mutPix });
     const fd = mf.effectById("fade").frag;
     const px = mf.effectById("pixelate").frag;
     check(!/g_FxStart <= g_FxEnd \? m : 1\.0 - m/.test(fd) && !/floor\(v_TexCoord \/ cell\) \+ vec2\(0\.5, 0\.5\)/.test(px), "渐隐不处理倒序 / 像素化取格角时判据变红");
@@ -7190,7 +7221,7 @@ section("LIGHT-CAM. light / camera 图层入口 editor/layer-kinds.ts + objlayer
   }
 
   // ── B2：真 GL pass（记账用的假 GL：只记调用，不真开上下文） ──
-  const glmod = await imp("renderer/src/editor/overlay-gl.ts");
+  const glmod = await loadRendererTs("renderer/src/editor/overlay-gl.ts"); // .glsl 导入要走 esbuild 装载器（Node 直载不认 .glsl）
   {
     const failPass = glmod.createOverlayPass(null);
     check(!failPass.ok && failPass.reason === "no-gl", "M12/B2 没有 GL 上下文时 pass.ok=false、reason=no-gl");

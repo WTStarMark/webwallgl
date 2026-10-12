@@ -1422,7 +1422,23 @@ const wireErrors = [];
 // [we-scene patch] **宏展开产生的相邻符号**：`-SHADOWMASK_HORIZGAPWIDTH` 而
 // `#define SHADOWMASK_HORIZGAPWIDTH -1.3` → `--1.3`。HLSL 按数值折叠（= +1.3）；
 // GLSL 把 `--` 当自减，报 `l-value required (can't modify a const)`（6 pass / 4 壁纸）。
+//
+// 两层行为（数值等效、都 = +1.3，下面两种文本形态都收，但**不得**放宽成任意文本）：
+//   ① 主路径（G10）：`hlsl2glsl.js` 的 `parenthesizeSignedMacroBodies` 在**宏定义期**
+//      就把以一元 ± 开头的宏体括号化 ⇒ `-W` 展开成 `-(-1.3)`，**根本不产生 `--`**；
+//   ② 兜底：同文件里的事后折叠补丁只覆盖「符号前是空格/逗号/左括号」的形态，那条路径给出 `+1.3`。
 {
+  /** 取 main 体里**真正那次** `G(0.5, …)` 调用（括号配平；函数原型 `G(float x, float o)` 不算）。 */
+  const callText = (src) => {
+    const i = src.indexOf("G(0.5,");
+    if (i < 0) return "?";
+    let depth = 0;
+    for (let k = i + 1; k < src.length; k++) {
+      if (src[k] === "(") depth++;
+      else if (src[k] === ")" && --depth === 0) return src.slice(i, k + 1);
+    }
+    return src.slice(i);
+  };
   const g = hlsl2glsl(
     "#define W -1.3\nfloat G(float x, float o){ return x+o; }\nvoid main(){ float v = G(0.5, -W); gl_FragColor=vec4(v); }",
     "frag",
@@ -1432,8 +1448,14 @@ const wireErrors = [];
   if (/--1\.3/.test(g)) {
     wireErrors.push("宏展开出的 `--<数字>` 必须折叠成 +（GLSL 会当自减运算符）");
   }
-  if (!/G\(0\.5, \+1\.3\)/.test(g)) {
-    wireErrors.push(`--1.3 应折叠成 +1.3，实得 ${(g.match(/G\([^)]*\)/) || ["?"])[0]}`);
+  // 新不变量：实参必须是定义期括号化 `-(-1.3)`（主路径）或事后折叠 `+1.3`（兜底）之一。
+  if (!/G\(0\.5, (?:\+1\.3|-\(-1\.3\))\)/.test(g)) {
+    wireErrors.push(`宏展开的负宏体须括号化 -(-1.3) 或折叠成 +1.3，实得 ${callText(g)}`);
+  }
+  // 与文本形态无关的守护：无论将来走哪条路径，都不得残留非法相邻符号（`--`/`+-` 紧跟数字）。
+  const illegal = g.match(/[+-][+-][ \t]*(?=[\d.])/g);
+  if (illegal) {
+    wireErrors.push(`宏展开后残留非法相邻符号 ${JSON.stringify(illegal)}`);
   }
   // 真自增/自减与「减负号变量」不得被碰
   const keep = [
