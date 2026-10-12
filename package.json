@@ -32,6 +32,7 @@
     "verify:text": "node scripts/verify-text.mjs",
     "verify:shaders": "node scripts/verify-shaders.mjs",
     "verify:glsl": "node scripts/verify-glsl.mjs",
+    "verify:bundle-hygiene": "node scripts/verify-bundle-hygiene.mjs",
     "verify:hlsl-macro": "node scripts/verify-hlsl-macro.mjs",
     "verify:sandbox": "node scripts/verify-sandbox.mjs",
     "verify:native-state": "node scripts/verify-native-state.mjs",

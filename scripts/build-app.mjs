@@ -7,7 +7,7 @@
  *   app/main.mjs       Electron 主进程（desktop/main.mjs，旁边有 server.mjs 即走生产形态）
  *   app/preload.cjs
  *   app/server.mjs     host/app-entry.ts 打包：静态站点 + 宿主端点，零运行时依赖
- *   app/web-shim.js    网页壁纸 shim（宿主注入 /web/ HTML 用）
+ *   app/web-shim.js    网页壁纸 shim（宿主注入 /web/ HTML 用；构建期压掉注释）
  *   app/site/          dist/ 下的站点产物（不含库产物 dist/lib）
  *
  * 同一个目录两种用途：
@@ -18,6 +18,7 @@ import { cpSync, existsSync, mkdirSync, readFileSync, readdirSync, rmSync, write
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 import esbuild from "esbuild";
+import { minifyJsText } from "./lib/min-js.mjs";
 
 const root = fileURLToPath(new URL("..", import.meta.url));
 const dist = join(root, "dist");
@@ -47,7 +48,12 @@ await esbuild.build({
   logLevel: "warning",
 });
 
-cpSync(join(root, "renderer", "src", "web-shim.js"), join(out, "web-shim.js"));
+// 网页壁纸 shim：**压过再拷**（宿主把它当文本注入 /web/ 的 HTML，源码里 14 KB 内部 JSDoc
+// 对运行无用，却会随注入文本落进作者的页面）。源码 renderer/src/web-shim.js 保持可读。
+writeFileSync(
+  join(out, "web-shim.js"),
+  await minifyJsText(readFileSync(join(root, "renderer", "src", "web-shim.js"), "utf8")),
+);
 cpSync(join(root, "desktop", "main.mjs"), join(out, "main.mjs"));
 cpSync(join(root, "desktop", "preload.cjs"), join(out, "preload.cjs"));
 cpSync(join(root, "desktop", "cli.mjs"), join(out, "cli.mjs"));

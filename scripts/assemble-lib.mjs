@@ -69,6 +69,10 @@ for (const { in: inFile, out: outFile, format } of MINIFY) {
     ...(format ? { format } : {}),
     loader: "js",
     legalComments: "none",
+    // 非 ASCII 直接以 UTF-8 落地。默认 charset:"ascii" 会把中文字符串转义成 `\uXXXX`
+    // （每个汉字 6 字节 vs 3 字节，三个包各多 ~45 KB），而且**看起来像漏剥的注释**：
+    // GLSL/契约注释的中文在压缩版里正是以 `\u7F16\u53F7…` 的形态出现，用户以为注释没清掉。
+    charset: "utf8",
   });
   const map = JSON.parse(result.map);
   map.file = outFile;
