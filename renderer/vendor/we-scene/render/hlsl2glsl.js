@@ -2,6 +2,46 @@
 // 预处理在 hlsl-preprocessor.js；本文件做方言转换与转译入口。
 import { preprocess, stripComments, expandMacrosIn, replaceWord, splitArgs } from './hlsl-preprocessor.js'
 
+/**
+ * [we-scene patch] **C 预处理器的括号语义：对象宏的替换文本以一元 ± 开头时，替换处
+ * 必须括号化。**
+ *
+ * 现象：作者写 `#define SHADOWMASK_HORIZGAPWIDTH -1.3`，在
+ * `Grille(uv.y, -SHADOWMASK_HORIZGAPWIDTH)` 处按文本拼接得到 `--1.3`。HLSL 预处理器
+ * 是**词法级替换**（替换文本自成 token 序列，等价于 `- -1.3`，合法），而 GLSL 编译器
+ * 对这段文本重新做词法分析 —— `--` 成了自减运算符，报
+ * `'--' : l-value required (can't modify a const)`，**整个 shadow_map pass 被跳过**
+ * （6 pass / 4 壁纸，见 docs/RENDERER-COMPLETION-PLAN.md G10）。
+ *
+ * 本文件下方那套「事后折叠相邻符号」只覆盖符号前是空格/逗号/左括号的形态
+ * （`x - -1.3` → `x + 1.3`），`x-NEG` / `(a)-NEG` 这类**无空格**写法仍然漏网。
+ * 所以在宏定义处按替换语义括号化，一次覆盖所有出现位置，也不再依赖上下文猜测
+ * （事后折叠保留，作为其它改写路径的兜底）。
+ *
+ * 只处理**对象宏**：函数宏的展开结果已由 hlsl-preprocessor 的 expandFunctionMacro
+ * 统一包裹 `(...)`。含顶层逗号 / 分号的宏体跳过（可能是多值或语句式用法，
+ * `#define PAIR -1.0, -2.0` 被包成 `(-1.0, -2.0)` 反而会坏掉 `vec2(PAIR)`）。
+ */
+function parenthesizeSignedMacroBodies(src) {
+  return src.replace(
+    /^([ \t]*#[ \t]*define[ \t]+[A-Za-z_][A-Za-z0-9_]*[ \t]+)([+-][^\n]*)$/gm,
+    (all, head, raw) => {
+      const body = raw.trim()
+      // 只有一个符号（`#define X -`）没有操作数，括号化会得到 `(-)`
+      if (body.length < 2) return all
+      // `--` / `+-` 这类纯符号宏体不是数值，保持原样
+      if (/^[+-][ \t]*[+-]/.test(body)) return all
+      let depth = 0
+      for (const ch of body) {
+        if (ch === '(') depth++
+        else if (ch === ')') depth--
+        else if (depth === 0 && (ch === ',' || ch === ';')) return all
+      }
+      return head + '(' + body + ')'
+    },
+  )
+}
+
 // 平衡括号内内容（返回右括号位置）
 function matchGroup(text, openIdx, openCh, closeCh) {
   let depth = 0
@@ -281,6 +321,12 @@ export function hlsl2glsl(src, stage, combos, includeResolver, siblingSrc) {
     )
   }
 
+  // [we-scene patch] 宏定义处的括号语义（见文件头 parenthesizeSignedMacroBodies）。
+  // 位置很关键：必须在 `expandMacrosIn` **之前**（展开发生在预处理器里，展开后再改文本
+  // 就晚了），同时必须在 `preprocess` **之后** —— 此时 #if 块已按 combo 裁剪完毕，
+  // 剩下的 `#define` 行只供 expandMacrosIn 使用，改它们的文本不参与条件求值；
+  // 而且 preprocess 已把 #include 的内容拼进 code，放这里能一并覆盖公共头里的宏。
+  code = parenthesizeSignedMacroBodies(code)
   code = expandMacrosIn(code, 20)
   code = code.replace(/^[ \t]*#define[^\n]*\n?/gm, '')
   // [we-scene patch] `#require <capability>` 是 WE 的能力门控声明（如 combine 的
@@ -335,7 +381,11 @@ export function hlsl2glsl(src, stage, combos, includeResolver, siblingSrc) {
       const cv = effective[name] !== undefined ? effective[name]
         : effective[name.toUpperCase()] !== undefined ? effective[name.toUpperCase()]
         : effective[name.toLowerCase()]
-      code = replaceWord(code, name, String(cv !== undefined ? cv : 0))
+      const v = cv !== undefined ? cv : 0
+      // [we-scene patch] **负值 combo 与负字面量宏同族**：`x-COMBO`（值为 -5）按文本拼成
+      // `x--5`，同样是 GLSL 词法层把 `--` 读成自减。括号化对任何出现位置都安全
+      // （包括 `arr[COMBO]` 这类常量表达式位置），非负值保持逐字不变。
+      code = replaceWord(code, name, v < 0 ? '(' + v + ')' : String(v))
     }
     // TEXnFORMAT 是引擎按绑定贴图注入的宏，不写 [COMBO]：#if 里按 0 求值，
     // 表达式里（fur4 的 `ConvertTextureFormat(TEX8FORMAT, …)`）也必须落成同一个值。

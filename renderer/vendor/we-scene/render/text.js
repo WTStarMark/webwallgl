@@ -9,7 +9,7 @@
 //   export function update(value) {
 //       return hours + scriptProperties.delimiter + minutes;
 //   }
-// 全库 335 个脚本用到的宿主符号（逆向统计）：
+// 全库 335 个脚本用到的宿主符号（本地语料统计）：
 //   scriptProperties.<name>     脚本属性（scene.json text.scriptproperties 的值，
 //                               缺省回落到 createScriptProperties 声明的默认值）
 //   update(value) → string      每帧求值；value = 当前文本；返回 undefined 则保留原文本
@@ -82,6 +82,15 @@ function applyEngineHost(engine, opts) {
   engine.isWallpaper = () => !screensaver
   engine.isDesktopDevice = () => true
   engine.isMobileDevice = () => false
+  // [we-scene patch] 官方 IEngine 声明的横竖屏查询（官方类型声明
+  // lib.sceneScript.d.ts:2392 isPortrait(): Boolean / :2397 isLandscape(): Boolean）
+  // 本仓此前两个成员都不存在：脚本写 `engine.isPortrait()` 会 TypeError，
+  // 按入口三振熔断后整个 update/媒体链一起停摆。形态与上面四个同类查询一致
+  // （都是方法，d.ts 也是方法签名），取值**实时**由 engine.screenResolution 推导
+  // （宿主会在 resize 时就地改写该字段，见 scene-mount 的 screenRes 回填），
+  // 宽高相等时算横屏。语料 0 处使用，属预留面补齐（docs/SCENESCRIPT-PLAN.md §P3）。
+  engine.isPortrait = () => Number(engine.screenResolution?.y || 0) > Number(engine.screenResolution?.x || 0)
+  engine.isLandscape = () => !engine.isPortrait()
   // WE 的 frametime 恒 > 0。宿主在首帧 / 同时间戳帧会写 0，Free Cam 的
   // `frametime * (1 / frametime)` 得 NaN，距离被污染后逐帧 TypeError（3281559867）——
   // 非正值忽略，保留上一帧的值。
@@ -802,6 +811,28 @@ function audioBufferSize(n) {
 }
 
 /**
+ * [we-scene patch] `add*` 声明的属性缺省值。除 addCombo 外都是「取 options.value」
+ * —— 官方 createScriptProperties 的实现（仓内 `local-assets/scripts/jsclasses/
+ * baseclasses.js:1443`，与随包 `assets/scripts/jsclasses/baseclasses.js` 逐字节相同）
+ * 每个 addXxx 都写 `vars[options.name] = options.value`，**只有 addCombo 例外**：
+ *   addCombo: function(options){ vars[options.name] = options.options[0].value; … }
+ * 即「脚本声明里没写 value 时，combo 的初值是第一个选项」。此前本仓对 combo 也读
+ * `def.value`，作者按官方写法省略 value 时脚本拿到 undefined（`switch(scriptProperties.x)`
+ * 落到 default 分支、显示态与 WE 不一致），且用户属性面板的首项并未被选中过。
+ * 只对 addCombo 生效：addText/addSlider/addColor 的缺省值就是 options.value，
+ * 按首项猜测会误伤（addText 的 options 是标签不是选项）。
+ */
+function declaredDefault(methodName, def) {
+  if (methodName === 'addCombo' && def.value === undefined) {
+    const opts = Array.isArray(def.options) ? def.options : []
+    const first = opts[0]
+    if (first !== null && typeof first === 'object' && 'value' in first) return first.value
+    if (first !== undefined && first !== null && typeof first !== 'object') return first
+  }
+  return propValue(def.value)
+}
+
+/**
  * [we-scene patch] `addColor({...})` / `addVec*(...)` 声明的脚本属性，scene.json 里
  * 存的是**颜色字符串**（"0.96 0.96 0.63"，与图层 color 字段同形态），而 WE 运行时
  * 交给脚本的是 Vec3。此前原样透传，3694771168 的时钟组脚本
@@ -962,7 +993,7 @@ export function evalTextScript(script, scriptprops, opts = {}) {
         return (def) => {
           if (def && typeof def === 'object' && typeof def.name === 'string') {
             if (!(def.name in spValues)) {
-              spValues[def.name] = propValue(def.value)
+              spValues[def.name] = declaredDefault(name, def)
             } else {
               // scene 值已存在（含 {user,value} 包装解出的快照）：按声明类型补转换
               applyDeclaredType(spValues, name, def.name)
@@ -2593,7 +2624,7 @@ export function evalObjectScript(script, scriptprops, opts = {}) {
         return (def) => {
           if (def && typeof def === 'object' && typeof def.name === 'string') {
             if (!(def.name in spValues)) {
-              spValues[def.name] = propValue(def.value)
+              spValues[def.name] = declaredDefault(name, def)
             } else {
               // scene 值已存在（含 {user,value} 包装解出的快照）：按声明类型补转换
               applyDeclaredType(spValues, name, def.name)

@@ -254,8 +254,16 @@ mat3 squareToQuad(vec2 p0, vec2 p1, vec2 p2, vec2 p3) {
   //     但旧版 3 抽样的 0.279/0.442/0.279 与官方当前的 0.25/0.5/0.25 **不同**，以官方为准；
   //  4. blurRadialNa 是绕 center 的**旋转（角向）模糊**，不是沿半径的缩放模糊：
   //     每个样本把 (uv - center) 旋转 amt * 0.025 * o 弧度。
-  // g_Texture0Resolution 四个分量都是像素尺寸：.xy 是补齐后的纹理尺寸（POT），
-  // .zw 是图像实际尺寸；都是被除数，不是倒数。
+  // g_Texture0Resolution **有两套 .zw 约定并存，本仓故意不统一（G4）**，
+  // 第三方 shader 直接读 .zw 会在两条路径上得到不同结果：
+  //  (a) 效果链（render/renderer.js:5263 `resolutions.set(ti, [t.width, t.height,
+  //      t.width, t.height])`，经 :1906-1908 逐个绑 g_TextureNResolution）：
+  //      .xy 是补齐后的纹理尺寸（POT），.zw 是图像实际尺寸；四个分量都是像素尺寸、
+  //      都是被除数，不是倒数 —— 上面第 2 条的顶点着色器即按此约定做除法；
+  //  (b) 粒子渲染（render/particles.js:2409 `gl.uniform4f(uRes, tw, th, 1/tw, 1/th)`，
+  //      取 location 在 :2405）：
+  //      .xy 是像素尺寸，.zw 是**倒数**（1/tw, 1/th）。
+  // 统一会改动既有 shader 的可见行为（需先定标），故只显式记录差异，不做归一。
   // **本头必须自己声明 g_Texture0**：`#include "common_blur.h"` 在文件第 4 行，
   // 而 `uniform sampler2D g_Texture0` 在第 8 行 —— GLSL 要求先声明后使用，
   // 若头里只引用不声明，实测报 `'g_Texture0' : undeclared identifier`。
@@ -390,14 +398,25 @@ vec4 ApplyComposite(vec4 original, vec4 effect) {
   // 标注这类贴图并重建 z。返回值的 .z 在现有 3 个调用点里从未被使用
   // （只用 normal.xy 做 UV 位移），故真正吃重的只有 *2-1 这步。
   // FORMAT_R8 / FORMAT_RG88 取 pkg/texture.js 的 .tex 格式枚举：RG88=8、R8=9。
-  // WE common_pbr_2.h（重建子集）：提供 PBR 基元与 CombineLighting，并把
-  // PerformLighting_V1 的**直射项置 0** —— 本仓不解析场景灯光对象
-  // （点光/聚光/平行光/阴影图集，官方 LightingV1 全帧平均贡献实测 ~2%，
-  // 见 renderer.js layerColorAmbient 注释），故 LIGHTING=1 走 ambient-only，
-  // 与 genericimage* 既有的 ambient 近似一致。这样 fluidsimulation combine
-  // 的 LIGHTING=1 分支（法线扰动染色）可编译运行；fur/foliage/chroma 等同头
-  // shader 也能过编译（真实直射光照留待引入灯光管线时补 PerformLighting_V1）。
-  'common_pbr_2.h': `// WE common_pbr_2.h（重建：PBR 基元 + ambient-only 灯光）
+  // WE common_pbr_2.h（重建子集）：提供 PBR 基元与 CombineLighting。
+  // 场景灯光对象**已被解析并实算**（不再是「本仓不解析」）：
+  //  - 解析：scene/parse.js:567-600（isLight :588、lightType 归一化 :589-592、lightLane :593、
+  //    lightRadius :595、intensity :596、exponent :600（缺省 1000/1/2）；:630-654 的 lightParams 只解析不渲染）；
+  //  - 着色：renderer-glsl.js:464-574 COPY_LIT_FRAG，两代衰减由 u_LightModel 选
+  //    —— 0 = 官方 common_pbr_2.h::ComputePBRLightShadow 的
+  //    saturate(1−d/radius)^exponent（V1 通道），1 = 官方 common_pbr.h::ComputePBRLight
+  //    的 radius²/d²（老通道，CPU 侧预乘 色×intensity×radius²）；
+  //  - 接线：render/renderer.js:2389-2409 bindLitUniforms 喂灯 uniform，
+  //    :3829-3830 每帧按 v1/legacy 双通道 collectSceneLights（MAX_SCENE_LIGHTS=4，
+  //    见 :508），:2813（合成趟）与 :4957（效果链 base 趟）两处调用它。
+  // 但本函数 PerformLighting_V1 **只覆盖效果 pass 那条路，那里直射项仍是 0**：
+  // 灯 uniform 只喂给图片层基色着色路径 COPY_LIT_FRAG，不喂效果 pass（详见本头
+  // GLSL 里 PerformLighting_V1 上方的自注）。别按本函数判断整库直射光 ——
+  // 图片层（2890473419 等 13 张）的直射光走 COPY_LIT_FRAG。这样 fluidsimulation
+  // combine 的 LIGHTING=1 分支（法线扰动染色）可编译运行；fur/foliage/chroma
+  // 等同头 shader 也能过编译。
+  // 阴影：本仓无阴影图集，shadowFactor 由调用方给、恒 1（无调用点 ⇒ 不可达）。
+  'common_pbr_2.h': `// WE common_pbr_2.h（重建：PBR 基元 + CombineLighting；本头只出 ambient 那一半，直射光走图片层 COPY_LIT_FRAG）
 #include "common.h"
 #ifndef M_PI
 #define M_PI 3.14159265359
@@ -747,9 +766,17 @@ void ComputeScreenRefractionTangents(in vec3 projectedPositionXYW, in vec3 right
 #endif
 }
 `,
-  // WE common_fog.h（逐条对齐官方）。FOG_DIST / FOG_HEIGHT 未开时全部退化为恒等，
-  // 所以本仓不解析场景雾参数时，引用它的 generic4 / genericimage4 / foliage4 等
-  // 只需能编译，画面与无雾一致。
+  // WE common_fog.h（逐条对齐官方）。FOG_DIST / FOG_HEIGHT 未开时全部退化为恒等：
+  // 本仓源码里没有 `#define` 这两个宏的位点，引用它的 generic4 / genericimage4 /
+  // foliage4 等只需能编译，画面与无雾一致；且本头的 g_Fog*Params / g_Fog*Color
+  // 四个 uniform 全仓**没有任何绑定点**（grep 命中只有本头），所以即便宏被打开，
+  // 浓度项也只会取到 0（颜色不变）。
+  // **别据此以为「本仓没有雾」**：场景雾参数已解析并在**另一条路径**上生效 ——
+  // renderer/src/scene-mount.ts:4657-4690 的 sceneFog IIFE（general.fogdistance*
+  // / fogheight*，换算说明见 :4651-4656，全库只有 3477054430「猫与城市」开了距离雾）
+  // → :4445-4448 随 puppet 回调以 `fog:` 转发 → render/mdl.js:888-896 按 FOG 门控
+  // 绑 u_fogOn / u_eye / u_fogDist* / u_fogHeight*（片元实现在 mdl.js:136-191），
+  // **只对真 3D（keepZ + 模型矩阵）生效**，2D 层不喂。
   'common_fog.h': `// WE common_fog.h（重建）
 #if FOG_DIST
 uniform vec3 g_FogDistanceColor;

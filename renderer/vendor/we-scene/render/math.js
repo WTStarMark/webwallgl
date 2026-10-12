@@ -363,6 +363,31 @@ export function fitWindow(fit, projW, projH, width, height, alignX, alignY) {
   return { offX: 0, offY: 0, viewW: projW, viewH: projH }
 }
 
+// [we-scene patch 2026-10-12] **contain 的 letterbox 带矩形**（画布像素、屏幕 y 向下）。
+// fit=contain 时可视窗口比设计矩形大（fitWindow 的加高/加宽分支），设计矩形
+// [0,projW]×[0,projH] 只占画布中间一块；WE 的原生语义是「场景先渲染到设计尺寸的
+// 画布、再按 fit 合成进窗口」，所以设计矩形之外**不属于最终画面**、应填 clearColor。
+// 但本渲染器是直接画到画布上的，view 之外的内容（例：3264246690 人物网格 y 到 2059、
+// 设计高只有 1440）会照常出现在黑边区里 —— 观感就是「人物下半身浮在灰底外、背景层
+// 显得太窄」。这里给出「需要盖回 clearColor」的矩形清单，供 renderer.js 的 contain
+// 遮罩 pass 使用；矩形是纯函数输出，可直接做门禁断言（scripts/verify-pointer.mjs）。
+// 世界→画布：sx=(wx−offX)/viewW*width、sy=(wy−offY)/viewH*height
+// （与 mat4Ortho(offX, offX+viewW, offY+viewH, offY) 同口径）。
+export function letterboxBands(viewW, viewH, offX, offY, projW, projH, width, height, minPx = 0.5) {
+  if (!(viewW > 0) || !(viewH > 0) || !(width > 0) || !(height > 0)) return []
+  const x0 = (-offX / viewW) * width
+  const x1 = ((projW - offX) / viewW) * width
+  const y0 = (-offY / viewH) * height
+  const y1 = ((projH - offY) / viewH) * height
+  const rects = []
+  // GL viewport 原点在左下，屏幕 y 向下 ⇒ 顶部带要换算成 (height - y0)。
+  if (y0 > minPx) rects.push([0, height - y0, width, y0])
+  if (height - y1 > minPx) rects.push([0, 0, width, height - y1])
+  if (x0 > minPx) rects.push([0, 0, x0, height])
+  if (width - x1 > minPx) rects.push([x1, 0, width - x1, height])
+  return rects
+}
+
 export function buildCamera(scene, width, height, fit, alignX, alignY) {
   const general = scene.general
   const cam = scene.camera

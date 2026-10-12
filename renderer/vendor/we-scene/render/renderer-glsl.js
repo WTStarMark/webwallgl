@@ -112,7 +112,10 @@ vec3 HSLToRGB(vec3 h) {
         weHueToRgb(f1, f2, h.x),
         weHueToRgb(f1, f2, h.x - 1.0 / 3.0));
 }
-// mode 编号同 WE common_blending.h（0=Normal … 32=LighterColor 的实现子集）
+// mode 编号同 WE common_blending.h 的 BLENDMODE；分支名取自该头的 BlendXxx 函数名。
+// 注意 5/10/32 在官方那头**没有**对应函数名（原文就是裸 min / 裸 max / mix(A,A+A*B,opacity)），
+// UI 名字表（locale 的 ui_editor_blending_*）与这些编号的对应关系尚未确证，
+// 详见 docs/re/we-native-renderstate-constants.md 的混合枚举对账表。
 vec3 ApplyBlending(int mode, vec3 A, vec3 B, float opacity) {
     vec3 r;
     if (mode == 1) { r = min(B, A); }                       // Darken
@@ -124,7 +127,7 @@ vec3 ApplyBlending(int mode, vec3 A, vec3 B, float opacity) {
             B.b == 0.0 ? 0.0 : max(1.0 - (1.0 - A.b) / B.b, 0.0));
     }
     else if (mode == 4 || mode == 20) { r = max(A + B - 1.0, vec3(0.0)); } // Substract
-    else if (mode == 5) { r = min(A, B); }                  // LinearBurn
+    else if (mode == 5) { r = min(A, B); }                  // 裸 min(A,B)：官方此分支无名，不是 LinearBurn（那是 4/20 的式子）
     else if (mode == 6) { r = max(B, A); }                  // Lighten
     else if (mode == 7) { r = 1.0 - (1.0 - A) * (1.0 - B); } // Screen
     else if (mode == 8) {                                   // ColorDodge
@@ -134,7 +137,7 @@ vec3 ApplyBlending(int mode, vec3 A, vec3 B, float opacity) {
             B.b == 1.0 ? 1.0 : min(A.b / (1.0 - B.b), 1.0));
     }
     else if (mode == 9) { r = min(A + B, vec3(1.0)); }      // Add
-    else if (mode == 10) { r = max(A, B); }                 // Lighter
+    else if (mode == 10) { r = max(A, B); }                 // 裸 max(A,B)：官方此分支无名
     else if (mode == 11) { r = weBlendOverlay(A, B); }      // Overlay
     else if (mode == 12) { r = weBlendSoftLight(A, B); }    // SoftLight
     else if (mode == 13) { r = weBlendOverlay(B, A); }      // HardLight
@@ -173,7 +176,7 @@ vec3 ApplyBlending(int mode, vec3 A, vec3 B, float opacity) {
     else if (mode == 29) { r = HSLToRGB(vec3(RGBToHSL(A).x, RGBToHSL(A).y, RGBToHSL(B).z)); } // Luminosity
     else if (mode == 30) { r = mix(A, max(max(A.r, max(A.g, A.b)), 0.0) * B, opacity); } // Tint
     else if (mode == 31) { r = A + B * opacity; }           // Add(带 opacity 权重)
-    else if (mode == 32) { r = mix(A, A + A * B, opacity); } // LinearDodge 变体
+    else if (mode == 32) { r = mix(A, A + A * B, opacity); } // 官方就是 mix(A,A+A*B,opacity)：此分支无名，不是 LinearDodge=min(A+B,1)
     else { r = mix(A, B, opacity); }                        // Normal(含 0)
     // CPU 参考（effects.js applyBlending）：5/10/30/31/32 直接返回不经 opacity 权重，
     // 其余统一 mix(A, r, opacity) 回归原色。
@@ -438,7 +441,7 @@ void main() {
 //   而灯是点光源、权重在几千像素的层上能差几倍 —— 整层乘同一个数会把「靠近灯的
 //   一侧被照亮」压成均匀染色（2890473419 的人物卡 1504×3000，三盏灯的 d 从
 //   ~700 到 ~1700）。
-// 口径（官方 shader 明文 + Waple 逆向互证，不要再自创公式）：
+// 口径（官方 shader 明文 + 运行时行为标定互证，不要再自创公式）：
 //   - **两代灯走两条通道、两套衰减**（详见 renderer.js 的灯光通道注释与
 //     `lightModelForShader`）：`l*` 前缀的 V1 灯供 generic4/genericimage4，
 //     衰减 = `saturate(1−d/radius)^exponent`；不带前缀的 `point` 供
